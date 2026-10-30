@@ -1,7 +1,7 @@
 //! One helper owner: cleanup on startup, apply on confirmation, cleanup on disconnect.
 use crate::{
     control::{self, Command, Lines},
-    windows_host::Request,
+    request::Request,
 };
 use std::{io, time::Duration};
 use tokio::io::{AsyncRead, AsyncWrite};

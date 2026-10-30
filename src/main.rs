@@ -6,7 +6,7 @@ use p2_middleware::{
     bridge::{launch_error_message, Bridge},
     config::Settings,
     network::{self, Adapter},
-    route_client::RouteClient,
+    RouteClient,
 };
 use std::{
     sync::mpsc::{self, Receiver},

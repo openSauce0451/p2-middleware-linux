@@ -56,10 +56,19 @@ impl Settings {
         }
         Ok(NetworkPlan { ps3, pc, router })
     }
+    #[cfg(windows)]
     pub fn path() -> io::Result<PathBuf> {
         std::env::var_os("LOCALAPPDATA")
-            .map(|p| PathBuf::from(p).join("P2Middleware/settings.toml"))
-            .ok_or_else(|| io::Error::other("Windows local application folder is unavailable"))
+        .map(|p| PathBuf::from(p).join("P2Middleware/settings.toml"))
+        .ok_or_else(|| io::Error::other("Windows local application folder is unavailable"))
+    }
+    #[cfg(not(windows))]
+    pub fn path() -> io::Result<PathBuf> {
+        let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .ok_or_else(|| io::Error::other("Could not locate a configuration directory"))?;
+        Ok(base.join("p2-middleware/settings.toml"))
     }
     pub fn load() -> io::Result<Self> {
         let p = Self::path()?;
