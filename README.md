@@ -1,3 +1,5 @@
+# ! INFO: This is a work-in-progress fork for Linux compatibility
+
 # P2 middleware
 
 A small Windows app that lets a stock PS3 copy of **Portal 2** sign in to Steam and
