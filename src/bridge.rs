@@ -27,7 +27,15 @@ impl Bridge {
         {
             return Err(io::Error::other("upstream_overlaps_native_addresses"));
         }
-        let executable = std::env::current_exe()?.with_file_name("p2-bridge.exe");
+
+        // Platform-aware executable name
+        #[cfg(windows)]
+        let bridge_name = "p2-bridge.exe";
+        #[cfg(not(windows))]
+        let bridge_name = "p2-bridge";
+
+        let executable = std::env::current_exe()?.with_file_name(bridge_name);
+
         let mut command = Command::new(executable);
         command.args([
             "serve",
@@ -37,29 +45,29 @@ impl Bridge {
             "true",
             "--peer",
             &plan.ps3.to_string(),
-            "--seconds",
-            "86400",
-            "--sessions",
-            "1000",
-            "--search-platform",
-            if settings.crossplay {
-                "any"
-            } else {
-                "preserve"
-            },
-            "--search-distance",
-            "worldwide",
-            "--advertise-platform",
-            if settings.crossplay {
-                "default"
-            } else {
-                "preserve"
-            },
+                     "--seconds",
+                     "86400",
+                     "--sessions",
+                     "1000",
+                     "--search-platform",
+                     if settings.crossplay {
+                         "any"
+                     } else {
+                         "preserve"
+                     },
+                     "--search-distance",
+                     "worldwide",
+                     "--advertise-platform",
+                     if settings.crossplay {
+                         "default"
+                     } else {
+                         "preserve"
+                     },
         ]);
         command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
         hidden(&mut command);
         #[cfg(windows)]
         let job = Job::new()?;
@@ -73,9 +81,9 @@ impl Bridge {
         let payload = Zeroizing::new(serde_json::to_vec(auth)?);
         let sent = (|| -> io::Result<()> {
             let mut input = child
-                .stdin
-                .take()
-                .ok_or_else(|| io::Error::other("Missing private pipe"))?;
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("Missing private pipe"))?;
             input.write_all(&payload)?;
             input.write_all(b"\n")
         })();
@@ -89,18 +97,22 @@ impl Bridge {
         let ready = Arc::new(AtomicBool::new(false));
         let worker_ready = ready.clone();
         thread::spawn(move || {
+            let debug = std::env::var_os("P2_DEBUG_BRIDGE").is_some();
             for line in io::BufReader::new(stderr).lines().map_while(Result::ok) {
+                if debug {
+                    eprintln!("[bridge-raw] {line}");
+                }
                 if serde_json::from_str::<serde_json::Value>(&line)
                     .ok()
                     .is_some_and(|v| v["event"] == "listening")
-                {
-                    worker_ready.store(true, Ordering::Release);
-                }
-                if let Some(message) = friendly_event(&line) {
-                    if tx.send(message.into()).is_err() {
-                        break;
+                    {
+                        worker_ready.store(true, Ordering::Release);
                     }
-                }
+                    if let Some(message) = friendly_event(&line) {
+                        if tx.send(message.into()).is_err() {
+                            break;
+                        }
+                    }
             }
         });
         Ok(Self {
@@ -127,19 +139,37 @@ impl Drop for Bridge {
         self.stop();
     }
 }
+
+// Platform-aware error messages
 pub fn launch_error_message(error: &io::Error) -> &'static str {
-    match error.raw_os_error() {
-        Some(225 | 226) => "Windows security blocked the bridge file. Review the detection in Windows Security; the app did not change your protections.",
-        Some(577) => "Windows could not verify the bridge image. Check the build and signature before retrying.",
-        Some(5) => "Windows denied access to the bridge. This can be a permission or security restriction.",
-        Some(2 | 3) => "The bridge executable is missing. Keep p2-bridge.exe beside the desktop app; check whether it was quarantined.",
-        _ => "Could not start the bridge. Check the selected address, port and companion executable.",
+    let code = error.raw_os_error();
+
+    #[cfg(windows)]
+    {
+        match code {
+            Some(225 | 226) => "Windows security blocked the bridge file. Review the detection in Windows Security; the app did not change your protections.",
+            Some(577) => "Windows could not verify the bridge image. Check the build and signature before retrying.",
+            Some(5) => "Windows denied access to the bridge. This can be a permission or security restriction.",
+            Some(2 | 3) => "The bridge executable is missing. Keep p2-bridge.exe beside the desktop app; check whether it was quarantined.",
+            _ => "Could not start the bridge. Check the selected address, port and companion executable.",
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        match code {
+            Some(2) => "The bridge executable is missing or has incorrect permissions. Check that p2-bridge exists next to the middleware binary.",
+            Some(13) => "Permission denied. Ensure p2-bridge has execute permission: chmod +x p2-bridge",
+            Some(8) => "Exec format error. Verify p2-bridge is built for your architecture.",
+            _ => "Could not start the bridge. Check that p2-bridge exists and is executable.",
+        }
     }
 }
+
 fn friendly_event(line: &str) -> Option<&'static str> {
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
     match value.get("event")?.as_str()? {
-        "listening" => Some("Bridge is listening. Preparing the Windows gateway..."),
+        "listening" => Some("Bridge is listening."),
         "ps3_connected" => Some("The PS3 connected to the bridge."),
         "official_login_result" => Some(if value["data"]["eresult"] == 1 {
             "Steam accepted the game login."
@@ -159,7 +189,6 @@ struct Job(windows_sys::Win32::Foundation::HANDLE);
 impl Job {
     fn new() -> io::Result<Self> {
         use windows_sys::Win32::System::JobObjects::*;
-        // The job handle is never inherited. Closing it terminates only our assigned worker.
         let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if handle.is_null() {
             return Err(io::Error::last_os_error());
@@ -172,7 +201,7 @@ impl Job {
                 handle,
                 JobObjectExtendedLimitInformation,
                 (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-                std::mem::size_of_val(&limits) as u32,
+                                    std::mem::size_of_val(&limits) as u32,
             )
         };
         if ok == 0 {
