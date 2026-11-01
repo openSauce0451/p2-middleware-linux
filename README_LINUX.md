@@ -2,9 +2,7 @@
 
 An AI-assisted Linux port of [p2-middleware](https://github.com/iowngamesibought/p2-middleware), extended with a **headless mode** and a **VPN bypass toolkit** so the full workflow works in one command while a VPN tunnel is active.
 
-**-> Follow [Quick start](https://github.com/openSauce0451/p2-middleware-linux/blob/dev/README_LINUX.md#quick-start) for running the middleware on Linux.**
-
-
+### **-> FOLLOW [Quick start](https://github.com/openSauce0451/p2-middleware-linux/blob/dev/README_LINUX.md#quick-start) FOR RUNNING THE MIDDLEWARE ON LINUX.**
 
 What this repo adds on top of the upstream middleware:
 
