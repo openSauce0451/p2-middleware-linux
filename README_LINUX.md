@@ -203,11 +203,11 @@ Instrumentation added during debugging (kept because they're useful): `[bridge-r
 
 Issues found in the upstream code during the Linux port, worked around here rather than fixed upstream:
 
-- **`p2-bridge.exe `hardcoding.** Upstream resolves the bridge executable with a Windows-only filename on all platforms; a Linux build needs the `.exe` removed or `#[cfg]`-gated.
+- **`p2-bridge.exe`hardcoding.** Upstream resolves the bridge executable with a Windows-only filename on all platforms; a Linux build needs the `.exe` removed or `#[cfg]`-gated.
 
-- **`network::adapters() `returns empty on Linux.** The adapter enumeration silently yields zero interfaces, so `for_console()` can never match; this fork's headless mode compensates with subnet-based detection.
+- **`network::adapters()`returns empty on Linux.** The adapter enumeration silently yields zero interfaces, so `for_console()` can never match; this fork's headless mode compensates with subnet-based detection.
 
-- **`launch_error_message() `is Windows-only.** Error-code mapping and the "quarantined" wording are meaningless on Linux and obscure real `ENOENT`/`EACCES` failures.
+- **`launch_error_message()`is Windows-only.** Error-code mapping and the "quarantined" wording are meaningless on Linux and obscure real `ENOENT`/`EACCES` failures.
 
 ### How the Steam port filtering was diagnosed
 
