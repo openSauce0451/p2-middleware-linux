@@ -161,21 +161,8 @@ pub(crate) fn atomic_replace(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Request {
-    pub settings: Settings,
-    pub interface: u32,
-}
-impl Request {
-    pub fn validate(&self) -> io::Result<()> {
-        self.settings.validate().map_err(io::Error::other)?;
-        if self.interface == 0 {
-            return Err(io::Error::other("interface_required"));
-        }
-        Ok(())
-    }
-}
+pub use crate::request::Request;
+
 pub fn elevated() -> bool {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use windows_sys::Win32::{
