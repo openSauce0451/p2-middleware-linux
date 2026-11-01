@@ -2,7 +2,7 @@
 
 An AI-assisted Linux port of [p2-middleware](https://github.com/iowngamesibought/p2-middleware), extended with a **headless mode** and a **VPN bypass toolkit** so the full workflow works in one command while a VPN tunnel is active.
 
-### **-> FOLLOW [Quick start](https://github.com/openSauce0451/p2-middleware-linux/blob/dev/README_LINUX.md#quick-start) FOR RUNNING THE MIDDLEWARE ON LINUX.**
+### **-> FOLLOW [Quick start](https://github.com/openSauce0451/p2-middleware-linux/blob/main/README_LINUX.md#quick-start) FOR RUNNING THE MIDDLEWARE ON LINUX.**
 
 What this repo adds on top of the upstream middleware:
 
@@ -32,9 +32,9 @@ PS3 (192.168.0.242)
  ▼      
 PC — eth0      
  ├─ ip rule: from 192.168.0.242 → table 900      
- │    └─ table 900: default via 192.168.0.1 dev eth0   	(bypasses tunnel)      
+ │    └─ table 900: default via 192.168.0.1 dev eth0   	   (bypasses tunnel)      
  ├─ SNAT: 192.168.0.242 → 192.168.0.33                     (return traffic)      
- ├─ Legacy CM aliases on eth0 (~26 × /32)                	(middleware adds)      
+ ├─ Legacy CM aliases on eth0 (~26 × /32)                  (middleware adds)      
  └─ Main table routes for Steam CM /24s →    192.168.0.1   (bridge upstream)
 ```
 
@@ -74,17 +74,18 @@ The bridge listens on TCP <Steam port>; the PS3's Steam traffic is intercepted b
 
 ## Quick start
 
-1. **Configure the PS3:** Settings → Network Settings → Internet Connection Settings → Custom. Set the **Default Router to the PC's LAN IP** (`192.168.0.33` in this setup). DNS can remain the router (e.g. `192.168.0.1`)` `or `1.1.1.1`.
+1. **Configure the PS3:** Settings → Network Settings → Internet Connection Settings → Custom. Set the **Default Router to the PC's LAN IP** (`192.168.0.33` in this setup). DNS can remain the router (e.g. `192.168.0.1`) or `1.1.1.1`. Set a manual IP address for your PS3 (`192.168.0.242` in this setup).
 
 2. **Connect the VPN** on the PC (optional — the workflow detects the tunnel and applies the bypass accordingly; without a tunnel it still sets up the plain relay).
 
 3. **Run the workflow:**
 Set these according to your network:
-<PS3_IP>	- e.g. 192.168.0.33
-<Router_IP>	- e.g. 192.168.0.1
+<PS3_IP>	(`e.g. 192.168.0.242`)
+<Router_IP>	(`e.g. 192.168.0.1`)
+<PATH_p2-middleware> (`e.g. ./p2-middleware`)
 
 ```
-   sudo ./p2-coop-full.sh --ps3 <PS3_IP> --router <Router_IP>
+   sudo ./p2-coop-full.sh --ps3 <PS3_IP> --router <Router_IP> --bin <PATH_p2-middleware>
 ```
 
 The script prints its configuration, clears stale state, brings up the bypass, and launches the middleware in headless mode.
@@ -106,7 +107,7 @@ The script prints its configuration, clears stale state, brings up the bypass, a
 
 ### Running the pieces manually
 
-Set PS3_IP, ROUTER_IP and IFACE (your network adapter) according to your network.
+Set PS3_IP, ROUTER_IP and IFACE (your PC network adapter) according to your network.
 
 ```
 export PS3_IP=192.168.0.242 ROUTER_IP=192.168.0.1 IFACE=eth0      
@@ -149,11 +150,11 @@ The most efficient diagnostic in this toolkit is the bridge's `probe` subcommand
 
 ```
 sudo ./p2-vpn-bypass.sh status          # everything the script tracks      
-ss -tlnp | grep <Steam port>          # bridge listening?      
+ss -tlnp | grep <Steam port>            # bridge listening?      
 ip -4 addr show eth0 | grep '/32'       # legacy CM aliases (~26)      
 ip rule show | grep 900                 # PS3 policy rule      
 sudo iptables -t nat -S POSTROUTING     # SNAT rules      
-sysctl net.ipv4.ip_forward             # relay prerequisite
+sysctl net.ipv4.ip_forward              # relay prerequisite
 ```
 
 ### Debug output
@@ -202,11 +203,11 @@ Instrumentation added during debugging (kept because they're useful): `[bridge-r
 
 Issues found in the upstream code during the Linux port, worked around here rather than fixed upstream:
 
-- **`p2-bridge.exe `hardcoding.** Upstream resolves the bridge executable with a Windows-only filename on all platforms; a Linux build needs the `.exe` removed or `#[cfg]`-gated.
+- **`p2-bridge.exe`hardcoding.** Upstream resolves the bridge executable with a Windows-only filename on all platforms; a Linux build needs the `.exe` removed or `#[cfg]`-gated.
 
-- **`network::adapters() `returns empty on Linux.** The adapter enumeration silently yields zero interfaces, so `for_console()` can never match; this fork's headless mode compensates with subnet-based detection.
+- **`network::adapters()`returns empty on Linux.** The adapter enumeration silently yields zero interfaces, so `for_console()` can never match; this fork's headless mode compensates with subnet-based detection.
 
-- **`launch_error_message() `is Windows-only.** Error-code mapping and the "quarantined" wording are meaningless on Linux and obscure real `ENOENT`/`EACCES` failures.
+- **`launch_error_message()`is Windows-only.** Error-code mapping and the "quarantined" wording are meaningless on Linux and obscure real `ENOENT`/`EACCES` failures.
 
 ### How the Steam port filtering was diagnosed
 
