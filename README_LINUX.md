@@ -34,7 +34,7 @@ PC — eth0
  ├─ ip rule: from 192.168.0.242 → table 900      
  │    └─ table 900: default via 192.168.0.1 dev eth0   	   (bypasses tunnel)      
  ├─ SNAT: 192.168.0.242 → 192.168.0.33                     (return traffic)      
- ├─ Legacy CM aliases on eth0 (~26 × /32)                	 (middleware adds)      
+ ├─ Legacy CM aliases on eth0 (~26 × /32)                  (middleware adds)      
  └─ Main table routes for Steam CM /24s →    192.168.0.1   (bridge upstream)
 ```
 
