@@ -2,6 +2,7 @@
 pub mod auth;
 pub mod channel;
 pub mod gateway;
+pub mod udp_relay;
 pub mod lobby_advertisement;
 pub mod lobby_diagnostics;
 pub mod protocol;
