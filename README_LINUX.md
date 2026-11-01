@@ -82,9 +82,10 @@ The bridge listens on TCP <Steam port>; the PS3's Steam traffic is intercepted b
 Set these according to your network:
 <PS3_IP>	- e.g. 192.168.0.33
 <Router_IP>	- e.g. 192.168.0.1
+<PATH-p2-middleware> - e.g. ./p2-middleware
 
 ```
-   sudo ./p2-coop-full.sh --ps3 <PS3_IP> --router <Router_IP>
+   sudo ./p2-coop-full.sh --ps3 <PS3_IP> --router <Router_IP> --bin <PATH-p2-middleware>
 ```
 
 The script prints its configuration, clears stale state, brings up the bypass, and launches the middleware in headless mode.
