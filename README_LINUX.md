@@ -74,13 +74,13 @@ The bridge listens on TCP <Steam port>; the PS3's Steam traffic is intercepted b
 
 ## Quick start
 
-1. **Configure the PS3:** Settings → Network Settings → Internet Connection Settings → Custom. Set the **Default Router to the PC's LAN IP** (`192.168.0.33` in this setup). DNS can remain the router (e.g. `192.168.0.1`)` `or `1.1.1.1`.
+1. **Configure the PS3:** Settings → Network Settings → Internet Connection Settings → Custom. Set the **Default Router to the PC's LAN IP** (`192.168.0.33` in this setup). DNS can remain the router (e.g. `192.168.0.1`) or `1.1.1.1`. Set a manual IP address for your PS3 (`192.168.0.242` in this setup).
 
 2. **Connect the VPN** on the PC (optional — the workflow detects the tunnel and applies the bypass accordingly; without a tunnel it still sets up the plain relay).
 
 3. **Run the workflow:**
 Set these according to your network:
-<PS3_IP>	- e.g. 192.168.0.33
+<PS3_IP>	- e.g. 192.168.0.242
 <Router_IP>	- e.g. 192.168.0.1
 <PATH-p2-middleware> - e.g. ./p2-middleware
 
