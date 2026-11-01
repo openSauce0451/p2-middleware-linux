@@ -1,4 +1,4 @@
-# ! INFO: This is a work-in-progress fork for Linux compatibility
+# ! INFO: This is a fork for Linux compatibility. Read the [LINUX README](https://github.com/openSauce0451/p2-middleware-linux/blob/dev/README_LINUX.md)
 
 # P2 middleware
 
