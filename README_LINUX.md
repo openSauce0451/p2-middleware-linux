@@ -32,9 +32,9 @@ PS3 (192.168.0.242)
  ▼      
 PC — eth0      
  ├─ ip rule: from 192.168.0.242 → table 900      
- │    └─ table 900: default via 192.168.0.1 dev eth0   	(bypasses tunnel)      
+ │    └─ table 900: default via 192.168.0.1 dev eth0   	   (bypasses tunnel)      
  ├─ SNAT: 192.168.0.242 → 192.168.0.33                     (return traffic)      
- ├─ Legacy CM aliases on eth0 (~26 × /32)                	(middleware adds)      
+ ├─ Legacy CM aliases on eth0 (~26 × /32)                	 (middleware adds)      
  └─ Main table routes for Steam CM /24s →    192.168.0.1   (bridge upstream)
 ```
 
@@ -107,7 +107,7 @@ The script prints its configuration, clears stale state, brings up the bypass, a
 
 ### Running the pieces manually
 
-Set PS3_IP, ROUTER_IP and IFACE (your network adapter) according to your network.
+Set PS3_IP, ROUTER_IP and IFACE (your PC network adapter) according to your network.
 
 ```
 export PS3_IP=192.168.0.242 ROUTER_IP=192.168.0.1 IFACE=eth0      
@@ -150,11 +150,11 @@ The most efficient diagnostic in this toolkit is the bridge's `probe` subcommand
 
 ```
 sudo ./p2-vpn-bypass.sh status          # everything the script tracks      
-ss -tlnp | grep <Steam port>          # bridge listening?      
+ss -tlnp | grep <Steam port>            # bridge listening?      
 ip -4 addr show eth0 | grep '/32'       # legacy CM aliases (~26)      
 ip rule show | grep 900                 # PS3 policy rule      
 sudo iptables -t nat -S POSTROUTING     # SNAT rules      
-sysctl net.ipv4.ip_forward             # relay prerequisite
+sysctl net.ipv4.ip_forward              # relay prerequisite
 ```
 
 ### Debug output
