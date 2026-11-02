@@ -5,6 +5,20 @@ use p2_bridge_core::{
     lobby_diagnostics::{SearchDistance, SearchPlatform},
     udp_relay::{self, UdpRelayConfig},
 };
+use serde_json::json;
+use std::{
+    env,
+    io::{self, BufRead, Read},
+    net::{Ipv4Addr, SocketAddr, TcpListener},
+    thread,
+    time::{Duration, Instant},
+};
+#[cfg(feature = "web-auth")]
+use std::{
+    io::{IsTerminal, Write},
+    path::PathBuf,
+};
+use zeroize::Zeroizing;
 
 fn serve(args: &[String]) -> io::Result<()> {
     let mut bind = "127.0.0.1:27017".parse::<SocketAddr>().unwrap();
@@ -30,7 +44,9 @@ fn serve(args: &[String]) -> io::Result<()> {
             "--search-platform" => search_platform = SearchPlatform::parse(&pair[1])?,
             "--search-distance" => search_distance = SearchDistance::parse(&pair[1])?,
             "--advertise-platform" => advertise_platform = AdvertisePlatform::parse(&pair[1])?,
-            "--udp-upstream" => udp_upstream = Some(pair[1].parse().map_err(|_| bad("udp_upstream"))?),
+            "--udp-upstream" => {
+                udp_upstream = Some(pair[1].parse().map_err(|_| bad("udp_upstream"))?)
+            }
             "--udp-ports" => {
                 let mut ports = Vec::new();
                 for part in pair[1].split(',') {
@@ -51,22 +67,20 @@ fn serve(args: &[String]) -> io::Result<()> {
         }
     }
     let private = |ip: Ipv4Addr| ip.is_private() || ip.is_loopback();
-    if !(matches!(bind.ip(),std::net::IpAddr::V4(ip) if private(ip))
+    if !(matches!(bind.ip(), std::net::IpAddr::V4(ip) if private(ip))
         || (native_cm && bind == "0.0.0.0:27017".parse::<SocketAddr>().unwrap()))
         || (native_cm && (!peer.is_private() || bind.port() != 27017))
         || !private(peer)
         || seconds == 0
         || seconds > 86400
         || !(1..=1000).contains(&sessions)
-        // New: a UDP upstream must be a usable IPv4 endpoint and must never
-        // be one of the locally-owned legacy aliases, or the relay would
-        // forward console datagrams straight back into its own listeners.
         || udp_upstream.is_some_and(|u| {
             !u.is_ipv4()
             || u.ip().is_loopback()
             || u.ip().is_unspecified()
             || u.port() == 0
-            || matches!(u.ip(), std::net::IpAddr::V4(ip) if p2_bridge_core::legacy_cm::LEGACY_CM.contains(&ip))
+            || matches!(u.ip(),
+                        std::net::IpAddr::V4(ip) if p2_bridge_core::legacy_cm::LEGACY_CM.contains(&ip))
         })
         {
             return Err(bad("configuration_bounds"));
@@ -85,7 +99,7 @@ fn serve(args: &[String]) -> io::Result<()> {
         drop(line);
         auth.validate()?;
         if native_cm
-            && matches!(auth.cm.ip(),std::net::IpAddr::V4(ip) if p2_bridge_core::legacy_cm::LEGACY_CM.contains(&ip))
+            && matches!(auth.cm.ip(), std::net::IpAddr::V4(ip) if p2_bridge_core::legacy_cm::LEGACY_CM.contains(&ip))
             {
                 return Err(bad("upstream_overlaps_native_addresses"));
             }
@@ -95,8 +109,7 @@ fn serve(args: &[String]) -> io::Result<()> {
         // UDP relay: only meaningful with --native-cm, because the legacy
         // aliases exist only while the native gateway is active. Defaults:
         // ports [27017] on each legacy address; upstream is the modern CM the
-        // authorization already carries, overridable with --udp-upstream for
-        // live-testing against a capture-derived endpoint.
+        // authorization already carries, overridable with --udp-upstream.
         let mut udp = if native_cm {
             let config = UdpRelayConfig {
                 peer,
@@ -112,7 +125,7 @@ fn serve(args: &[String]) -> io::Result<()> {
 
         event(
             "listening",
-            json!({"bind":bind.to_string(),"peer":peer.to_string(),"seconds":seconds,"sessions":sessions,"central_service":false,"search_platform":search_platform.name(),"search_distance":search_distance.name(),"advertise_platform":advertise_platform.name(),"udp_relay":native_cm,"udp_upstream":udp.as_ref().map(|u| u.flow_count())}),
+            json!({"bind":bind.to_string(),"peer":peer.to_string(),"seconds":seconds,"sessions":sessions,"central_service":false,"search_platform":search_platform.name(),"search_distance":search_distance.name(),"advertise_platform":advertise_platform.name(),"udp_relay":native_cm}),
         );
         let deadline = Instant::now() + Duration::from_secs(seconds);
         let mut count = 0;
@@ -152,7 +165,6 @@ fn serve(args: &[String]) -> io::Result<()> {
                 Err(e) => return Err(e),
             }
         }
-        // Stops the relay threads and prints udp_relay_stopped before "stopped".
         if let Some(mut u) = udp.take() {
             u.stop();
         }
@@ -161,4 +173,103 @@ fn serve(args: &[String]) -> io::Result<()> {
             json!({"sessions":count,"rejected_peers":rejected}),
         );
         Ok(())
+}
+fn probe(address: SocketAddr) -> io::Result<()> {
+    let (socket, _) = channel::connect(address, Instant::now() + Duration::from_secs(15))?;
+    drop(socket);
+    event(
+        "official_handshake_pass",
+        json!({"endpoint":address.to_string(),"result":1,"application_login_sent":false}),
+    );
+    Ok(())
+}
+fn probe_encrypted(address: SocketAddr) -> io::Result<()> {
+    use p2_bridge_core::protocol as p;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let (mut socket, crypto) = channel::connect(address, deadline)?;
+    let mut body = Vec::new();
+    p::vi(1, p::MODERN_PROTOCOL, &mut body);
+    channel::send_frame(
+        &mut socket,
+        &crypto.encode(&p::message(9805, &[], &body)),
+                        deadline,
+    )?;
+    p::vi(7, 20, &mut body);
+    p::bin(6, b"english", &mut body);
+    let mut header = Vec::new();
+    p::fixed64(1, 0x01a0_0000_0000_0000, &mut header);
+    p::vi(2, 0, &mut header);
+    channel::send_frame(
+        &mut socket,
+        &crypto.encode(&p::message(5514, &header, &body)),
+                        deadline,
+    )?;
+    for _ in 0..16 {
+        let frame = channel::read_frame(&mut socket, deadline)?;
+        let plain = Zeroizing::new(crypto.decode(&frame)?);
+        for message in p::flatten(&plain)? {
+            if p::id(&message)? == 751 {
+                let (_, h, b) = p::proto(&message)?;
+                let result = p::uint(&p::fields(b)?, 1)?.unwrap_or(2);
+                event(
+                    "official_encrypted_probe",
+                    json!({"anonymous":true,"eresult":result,"hmac_verified":true,"player_credentials_sent":false,"ps3_connected":false}),
+                );
+                channel::send_frame(
+                    &mut socket,
+                    &crypto.encode(&p::message(706, h, &[])),
+                                    deadline,
+                )?;
+                return Ok(());
+            }
+        }
+    }
+    Err(bad("probe_no_logon_response"))
+}
+fn run() -> io::Result<()> {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    match args.first().map(String::as_str) {
+        Some("serve") => serve(&args[1..]),
+        Some("probe") if args.len() == 2 => probe(args[1].parse().map_err(|_| bad("endpoint"))?),
+        Some("probe-encrypted") if args.len() == 2 => {
+            probe_encrypted(args[1].parse().map_err(|_| bad("endpoint"))?)
+        }
+        #[cfg(feature = "web-auth")]
+        Some("directory") if args.len() == 1 => {
+            println!(
+                "{}",
+                json!(p2_bridge_core::auth::directory()?
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>())
+            );
+            Ok(())
+        }
+        #[cfg(feature = "web-auth")]
+        Some("authorize") if args.len() == 4 && args[1] == "--qr" => {
+            if io::stdout().is_terminal() {
+                return Err(bad("authorization_requires_private_output_pipe"));
+            }
+            let cm = args[3].parse::<SocketAddr>().map_err(|_| bad("cm"))?;
+            let auth = p2_bridge_core::auth::authorize(&PathBuf::from(&args[2]), cm)?;
+            // stdout is ONLY the explicit credential pipe. Operational events go to stderr.
+            let out = Zeroizing::new(serde_json::to_vec(&json!({"account_name":auth.account_name,"refresh_token":auth.refresh_token,"cm":auth.cm.to_string()})).map_err(|_| bad("auth_serialize"))?);
+            io::stdout().lock().write_all(&out)?;
+            io::stdout().lock().write_all(b"\n")?;
+            Ok(())
+        }
+        _ => {
+            eprintln!("portal2-gateway directory | probe <CM-IP:port> | authorize --qr <local.svg> <CM-IP:port> | serve [--bind private-IP:port --peer PS3-IP --seconds 600 --sessions 3 (max 86400 / 1000) --search-platform preserve|any --search-distance preserve|worldwide --advertise-platform preserve|default --udp-ports 27017 --udp-upstream <CM-IP:port>]\nAuthorize stdout contains credentials: connect it directly to serve stdin over a local pipe or SSH.");
+            Err(bad("usage"))
+        }
+    }
+}
+fn main() {
+    if let Err(e) = run() {
+        event(
+            "fatal",
+            json!({"reason":e.to_string(),"kind":format!("{:?}",e.kind())}),
+        );
+        std::process::exit(1);
+    }
 }
