@@ -1,16 +1,35 @@
-//! Linux privileged network helper, invoked via `pkexec`.
-
 use p2_middleware::{
     control::{self, Command, Lines},
-    elevation_linux, journal_linux, network_linux, session,
+    session,
 };
 use std::{io, process::ExitCode, time::Duration};
+
+#[cfg(windows)]
+use p2_middleware::native_gateway::NativeHost;
+#[cfg(windows)]
+use p2_middleware::windows_host::{elevated, JournalStore};
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::NamedPipeClient;
+
+#[cfg(not(windows))]
+use p2_middleware::{
+    elevation_linux::elevated, journal_linux::JournalStore, network_linux::NativeHost,
+};
+#[cfg(not(windows))]
 use tokio::net::UnixStream;
+
+/// Control channel to the GUI: a named pipe on Windows, a Unix domain socket
+/// elsewhere. Both satisfy `AsyncRead + AsyncWrite + Unpin`, which is why
+/// `serve` below is written only once.
+#[cfg(windows)]
+type Channel = NamedPipeClient;
+#[cfg(not(windows))]
+type Channel = UnixStream;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() != 4 || args[0] != "--pipe" || args[2] != "--parent" {
-        eprintln!("usage: p2-route --pipe <socket> --parent <pid>");
+        eprintln!("usage: p2-route --pipe <name> --parent <pid>");
         return ExitCode::FAILURE;
     }
     let parent: u32 = args[3].parse().unwrap_or(0);
@@ -20,10 +39,12 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(socket_path: &str, parent: u32) -> io::Result<bool> {
+fn run(name: &str, parent: u32) -> io::Result<bool> {
     let runtime = control::runtime()?;
     runtime.block_on(async {
-        let mut stream = p2_middleware::control_linux::client(socket_path, parent)?;
+        // `control::client` is the platform transport: it validates the name
+        // grammar and verifies the far end is the process that launched us.
+        let mut stream = control::client(name, parent)?;
         let result = serve(&mut stream).await;
         if let Err(reason) = result {
             // A closed reporting channel must not abort recovery.
@@ -33,7 +54,7 @@ fn run(socket_path: &str, parent: u32) -> io::Result<bool> {
     })
 }
 
-async fn serve(stream: &mut UnixStream) -> Result<(), &'static str> {
+async fn serve(stream: &mut Channel) -> Result<(), &'static str> {
     let mut lines = Lines::default();
     let line = tokio::time::timeout(Duration::from_secs(30), lines.next(stream))
     .await
@@ -45,11 +66,14 @@ async fn serve(stream: &mut UnixStream) -> Result<(), &'static str> {
     if !matches!(command, Command::Session) {
         return Err("invalid_request");
     }
-    if !elevation_linux::elevated() {
+    if !elevated() {
         return Err("administrator_required");
     }
 
-    let store = journal_linux::JournalStore::open().map_err(|_| "store_unavailable")?;
-    let mut host = network_linux::NativeHost::new(store);
+    // `JournalStore` + `NativeHost` are the platform pair: the Linux
+    // network/journalling modules, or the Windows IpHelper address aliases
+    // plus the firewall-record journal. Both implement `session::Network`.
+    let store = JournalStore::open().map_err(|_| "store_unavailable")?;
+    let mut host = NativeHost::new(store);
     session::run(stream, lines, &mut host).await
 }
