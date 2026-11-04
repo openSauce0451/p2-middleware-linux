@@ -3,6 +3,8 @@ pub mod auth;
 pub mod channel;
 pub mod gateway;
 pub mod udp_relay;
+pub mod ps3_tunnel;
+pub mod tunnel_setup;
 pub mod lobby_advertisement;
 pub mod lobby_diagnostics;
 pub mod protocol;

@@ -3,6 +3,7 @@ use p2_bridge_core::{
     gateway::{self, event, Authorization},
     lobby_advertisement::AdvertisePlatform,
     lobby_diagnostics::{SearchDistance, SearchPlatform},
+    ps3_tunnel::{self, TunnelConfig},
     udp_relay::{self, UdpRelayConfig},
 };
 use serde_json::json;
@@ -18,7 +19,8 @@ use std::{
     io::{IsTerminal, Write},
     path::PathBuf,
 };
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
+use crate::ps3_tunnel::{StunCfg};
 
 fn serve(args: &[String]) -> io::Result<()> {
     let mut bind = "127.0.0.1:27017".parse::<SocketAddr>().unwrap();
@@ -31,6 +33,15 @@ fn serve(args: &[String]) -> io::Result<()> {
     let mut advertise_platform = AdvertisePlatform::default();
     let mut udp_upstream: Option<SocketAddr> = None;
     let mut udp_ports: Option<Vec<u16>> = None;
+    // Tunnel flags: all five must be present together (all-or-nothing), or
+    // none of them. A partial set means a misconfigured launch and is a
+    // configuration_bounds failure, never a silently-disabled tunnel.
+    let mut tunnel_ps3: Option<Ipv4Addr> = None;
+    let mut tunnel_band: Option<(u16, u16)> = None;
+    let mut tunnel_port: Option<u16> = None;
+    let mut tunnel_wire: Option<u16> = None;
+    let mut tunnel_peer: Option<SocketAddr> = None;
+    let mut tunnel_key: Option<String> = None;
     for pair in args.chunks(2) {
         if pair.len() != 2 {
             return Err(bad("missing_option_value"));
@@ -63,8 +74,49 @@ fn serve(args: &[String]) -> io::Result<()> {
                 }
                 udp_ports = Some(ports);
             }
+            "--tunnel-ps3" => {
+                tunnel_ps3 = Some(pair[1].parse().map_err(|_| bad("tunnel_ps3"))?)
+            }
+            "--tunnel-band" => {
+                // "FIRST-LAST", inclusive. Defense-in-depth on the same rules
+                // config.rs enforces at save time; serve() can be called manually.
+                let (a, b) = pair[1]
+                .split_once('-')
+                .ok_or_else(|| bad("tunnel_band"))?;
+                let first: u16 = a.trim().parse().map_err(|_| bad("tunnel_band"))?;
+                let last: u16 = b.trim().parse().map_err(|_| bad("tunnel_band"))?;
+                if first < 1024
+                    || last < first
+                    || u32::from(last) - u32::from(first) + 1 > 512
+                    {
+                        return Err(bad("tunnel_band"));
+                    }
+                    tunnel_band = Some((first, last));
+            }
+            "--tunnel-port" => {
+                tunnel_port = Some(pair[1].parse().map_err(|_| bad("tunnel_port"))?)
+            }
+            "--tunnel-wire" => {
+                tunnel_wire = Some(pair[1].parse().map_err(|_| bad("tunnel_wire"))?)
+            }
+            "--tunnel-peer" => {
+                tunnel_peer = Some(pair[1].parse().map_err(|_| bad("tunnel_peer"))?)
+            }
+            "--tunnel-key" => tunnel_key = Some(pair[1].to_string()),
             _ => return Err(bad("unknown_option")),
         }
+    }
+    // All-or-nothing: either every tunnel flag is present, or none is.
+    let tunnel_flags = [
+        tunnel_ps3.is_some(),
+        tunnel_port.is_some(),
+        tunnel_wire.is_some(),
+        tunnel_peer.is_some(),
+        tunnel_key.is_some(),
+    ];
+    let tunnel_enabled = tunnel_flags[0];
+    if !tunnel_flags.iter().all(|present| *present == tunnel_enabled) {
+        return Err(bad("tunnel_config_partial"));
     }
     let private = |ip: Ipv4Addr| ip.is_private() || ip.is_loopback();
     if !(matches!(bind.ip(), std::net::IpAddr::V4(ip) if private(ip))
@@ -81,6 +133,27 @@ fn serve(args: &[String]) -> io::Result<()> {
             || u.port() == 0
             || matches!(u.ip(),
                         std::net::IpAddr::V4(ip) if p2_bridge_core::legacy_cm::LEGACY_CM.contains(&ip))
+        })
+        // Tunnel bounds: the remote console must be a private address (it is
+        // the OTHER console's LAN address, which our console dials); the wire
+        // port must be sane; the wire peer must be a usable public endpoint
+        // and must NOT be one of our own native aliases (the tunnel would
+        // feed itself, the same self-interception hazard the CM check guards
+        // against); the base64 key is length-capped generously (32 bytes ->
+        // 44 chars).
+        || tunnel_ps3.is_some_and(|ip| !ip.is_private() || ip == peer)
+        || tunnel_port.is_some_and(|p| p == 0)
+        || tunnel_wire.is_some_and(|p| !(1024..=65535).contains(&p))
+        || tunnel_peer.is_some_and(|p| {
+            p.port() == 0
+            || p.ip().is_loopback()
+            || p.ip().is_unspecified()
+            || !p.is_ipv4()
+            || matches!(p.ip(),
+                        std::net::IpAddr::V4(ip) if p2_bridge_core::legacy_cm::LEGACY_CM.contains(&ip))
+        })
+        || tunnel_key.as_deref().is_some_and(|k| {
+            k.is_empty() || k.len() > 88
         })
         {
             return Err(bad("configuration_bounds"));
@@ -123,9 +196,47 @@ fn serve(args: &[String]) -> io::Result<()> {
             None
         };
 
+        // Gameplay tunnel between the two middleware instances. The key
+        // arrives as a base64 string (a rotatable session PSK, not an account
+        // credential); decode it here, copy into the fixed array, and zero
+        // the intermediates. Ps3Tunnel::spawn blocks until the /32 alias for
+        // the remote PS3 exists (bind_with_retry), so the privileged helper
+        // may create it after serve() starts.
+        let mut tunnel = if tunnel_enabled {
+            use base64::Engine;
+            let material =
+            Zeroizing::new(base64::engine::general_purpose::STANDARD
+            .decode(tunnel_key.as_deref().unwrap())
+            .map_err(|_| bad("tunnel_key"))?);
+            if material.len() != 32 {
+                return Err(bad("tunnel_key"));
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&material);
+            let config = TunnelConfig {
+                local_ps3: peer,
+                remote_ps3: tunnel_ps3.unwrap(),
+                remote_port: tunnel_port.unwrap(),
+                wire_bind: SocketAddr::new(
+                    std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                                           tunnel_wire.unwrap(),
+                ),
+                wire_peer: tunnel_peer.unwrap(),
+                key,
+                seconds,
+                stun: StunCfg::default(),
+                port_band: tunnel_band,
+            };
+            let spawned = ps3_tunnel::Ps3Tunnel::spawn(config);
+            key.zeroize();
+            Some(spawned?)
+        } else {
+            None
+        };
+
         event(
             "listening",
-            json!({"bind":bind.to_string(),"peer":peer.to_string(),"seconds":seconds,"sessions":sessions,"central_service":false,"search_platform":search_platform.name(),"search_distance":search_distance.name(),"advertise_platform":advertise_platform.name(),"udp_relay":native_cm}),
+            json!({"bind":bind.to_string(),"peer":peer.to_string(),"seconds":seconds,"sessions":sessions,"central_service":false,"search_platform":search_platform.name(),"search_distance":search_distance.name(),"advertise_platform":advertise_platform.name(),"udp_relay":native_cm,"tunnel":tunnel_enabled}),
         );
         let deadline = Instant::now() + Duration::from_secs(seconds);
         let mut count = 0;
@@ -164,6 +275,9 @@ fn serve(args: &[String]) -> io::Result<()> {
                 }
                 Err(e) => return Err(e),
             }
+        }
+        if let Some(mut t) = tunnel.take() {
+            t.stop();
         }
         if let Some(mut u) = udp.take() {
             u.stop();
@@ -259,7 +373,7 @@ fn run() -> io::Result<()> {
             Ok(())
         }
         _ => {
-            eprintln!("portal2-gateway directory | probe <CM-IP:port> | authorize --qr <local.svg> <CM-IP:port> | serve [--bind private-IP:port --peer PS3-IP --seconds 600 --sessions 3 (max 86400 / 1000) --search-platform preserve|any --search-distance preserve|worldwide --advertise-platform preserve|default --udp-ports 27017 --udp-upstream <CM-IP:port>]\nAuthorize stdout contains credentials: connect it directly to serve stdin over a local pipe or SSH.");
+            eprintln!("portal2-gateway directory | probe <CM-IP:port> | authorize --qr <local.svg> <CM-IP:port> | serve [--bind private-IP:port --peer PS3-IP --seconds 600 --sessions 3 (max 86400 / 1000) --search-platform preserve|any --search-distance preserve|worldwide --advertise-platform preserve|default --udp-ports 27017 --udp-upstream <CM-IP:port> --tunnel-ps3 <REMOTE-PS3-IP> --tunnel-port <REMOTE-PS3-PORT> --tunnel-wire <OWN-PORT> --tunnel-peer <PUBLIC-IP:PORT> --tunnel-key <BASE64> [--tunnel-band FIRST-LAST]]\nAuthorize stdout contains credentials: connect it directly to serve stdin over a local pipe or SSH. Tunnel flags are all-or-nothing.");
             Err(bad("usage"))
         }
     }
