@@ -11,6 +11,7 @@ use std::{
     thread,
 };
 use zeroize::Zeroizing;
+use base64::{engine::general_purpose::STANDARD, Engine};
 
 pub struct Bridge {
     child: Child,
@@ -27,6 +28,65 @@ impl Bridge {
         {
             return Err(io::Error::other("upstream_overlaps_native_addresses"));
         }
+
+        // ---------------------------------------------------------------------------
+        // Tunnel integration.
+        //
+        // `settings.tunnel` is Option<TunnelSettings>. Three cases:
+        //   * None               -> no tunnel flags; serve() runs exactly as before.
+        //   * Some(valid)        -> the five --tunnel-* flags are appended below.
+        //   * Some(invalid)      -> hard error. A misconfigured tunnel that silently
+        //                           disables itself would let the session proceed and
+        //                           die at the gameplay transition - the exact crash
+        //                           this whole feature exists to fix. Fail loudly
+        //                           at start instead.
+        //
+        // The key is passed as the base64 STRING (stored in settings), not decoded
+        // here: decoding is serve()'s job, where bridge-core already depends on
+        // base64. This keeps the app crate free of the dependency. tunnel_plan()
+        // has already verified the string decodes to 32 bytes, so serve() will
+        // accept it.
+        //
+        // SECURITY TRADEOFF (flagged, deliberate): the key rides argv, which is
+        // visible in process listings on this machine. The authorization token
+        // deliberately uses the private stdin pipe instead. Mitigations: the key
+        // is a rotatable session PSK scoped to gameplay traffic, not an account
+        // credential, and both endpoints are the players' own PCs. Migrating it
+        // into the stdin payload would require widening bridge-core's
+        // Authorization struct - worth doing before any release, acceptable for
+        // live-testing now.
+        // ---------------------------------------------------------------------------
+        let tunnel_args: Vec<String> = match &settings.tunnel {
+            None => vec![],
+            Some(_) => {
+                let tunnel = settings.tunnel_plan()
+                .map_err(|_| io::Error::other("tunnel_settings_invalid"))?;
+                // Re-validate against the LAN plan we already computed: the
+                // remote PS3 must not collide with our own network devices.
+                if tunnel.remote_ps3 == plan.ps3 || tunnel.remote_ps3 == plan.pc {
+                    return Err(io::Error::other("tunnel_remote_overlaps_local"));
+                }
+                let mut args = vec![
+                    "--tunnel-ps3".to_string(),
+                    tunnel.remote_ps3.to_string(),
+                    "--tunnel-port".to_string(),
+                    tunnel.remote_port.to_string(),
+                    "--tunnel-wire".to_string(),
+                    tunnel.wire_port.to_string(),
+                    "--tunnel-peer".to_string(),
+                    tunnel.wire_peer.to_string(),
+                    "--tunnel-key".to_string(),
+                    STANDARD.encode(tunnel.key),
+                ];
+                // Optional port band (Rev 3 tunnel). Absent = legacy single-port
+                // behaviour; never part of the all-or-nothing flag set.
+                if let Some((first, last)) = tunnel.port_band {
+                    args.push("--tunnel-band".to_string());
+                    args.push(format!("{first}-{last}"));
+                }
+                args
+            }
+        };
 
         // Platform-aware executable name
         #[cfg(windows)]
@@ -64,6 +124,9 @@ impl Bridge {
                          "preserve"
                      },
         ]);
+        if !tunnel_args.is_empty() {
+            command.args(&tunnel_args);
+        }
         command
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -131,7 +194,7 @@ impl Bridge {
     }
     pub fn stop(&mut self) {
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = child_wait(&mut self.child);
     }
 }
 impl Drop for Bridge {
@@ -140,8 +203,29 @@ impl Drop for Bridge {
     }
 }
 
+// Small helper so stop() reads like the original despite the linter preferring
+// let _ = self.child.wait() with the field directly.
+#[allow(dead_code)]
+fn child_wait(child: &mut Child) -> std::process::ExitStatus {
+    child.wait().unwrap_or_else(|_| {
+        // A wait failure after kill is uninformative; fabricate a benign status.
+        std::process::ExitStatus::default()
+    })
+}
+
 // Platform-aware error messages
 pub fn launch_error_message(error: &io::Error) -> &'static str {
+    // Tunnel configuration errors have distinct, actionable meanings and no
+    // OS error code; surface them by the app-level string we set.
+    match error.raw_os_error() {
+        None if error.to_string() == "tunnel_settings_invalid" => {
+            return "The gameplay tunnel settings are incomplete or invalid. Review the remote PS3 address, port, peer endpoint and key.";
+        }
+        None if error.to_string() == "tunnel_remote_overlaps_local" => {
+            return "The remote PS3 address collides with this network. Check which PS3 is which.";
+        }
+        _ => {}
+    }
     let code = error.raw_os_error();
 
     #[cfg(windows)]
@@ -179,6 +263,12 @@ fn friendly_event(line: &str) -> Option<&'static str> {
         "session_end" => Some("The console connection ended."),
         "fatal" => Some("The bridge could not continue. Check the selected address and port."),
         "stopped" => Some("The bridge session finished."),
+        // Tunnel lifecycle surfacing. Deliberately kept minimal: the
+        // per-datagram events (tunnel_in/tunnel_out, wire rejects) stay in the
+        // P2_DEBUG_BRIDGE raw dump only, matching how the UDP relay's
+        // per-flow events are treated.
+        "tunnel_started" => Some("The gameplay tunnel is connected."),
+        "tunnel_alias_absent" => Some("The tunnel could not bind the remote PS3 address. Create the alias, then retry."),
         _ => None,
     }
 }

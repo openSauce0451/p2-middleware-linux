@@ -123,12 +123,12 @@ pub struct NativeHost {
     failed: bool,
 }
 impl NativeHost {
-    pub fn new(store: JournalStore) -> Self {
-        Self {
+    pub fn new(store: JournalStore) -> io::Result<Self> {
+        Ok(Self {
             store,
             renewed: None,
             failed: false,
-        }
+        })
     }
     fn renew(&mut self) -> io::Result<()> {
         let r = self
@@ -150,12 +150,52 @@ impl NativeHost {
         }
         Ok(())
     }
+    // =============================================================================
+    // FIX — src/native_gateway.rs, NativeHost::read()
+    //
+    // Replace the existing `let path = match fs::symlink_metadata(&pending) {...}`
+    // block with the version below. Nothing else in the file changes.
+    //
+    // WHY THIS IS NEEDED
+    //
+    // A zero-length `native-gateway.next` is a torn write: the helper died between
+    // create_new and the first flush. read() preferred that file, parsed zero
+    // bytes, failed, and restore() surfaced recovery_incomplete -- while write()'s
+    // create_new refused the existing path, so the store could neither be read nor
+    // rewritten. Recovery was impossible by construction, on every launch, forever.
+    //
+    // WHY DROPPING AN EMPTY PENDING FILE LOSES NOTHING
+    //
+    // Every network side effect is performed only AFTER the record that authorises
+    // it is durable in the base file:
+    //
+    //     r.firewall_intent = true;
+    //     self.write(&r)?;                                  // durable first
+    //     windows_host::command("native_rule_add", ..)?;    // side effect second
+    //
+    // The same holds for forwarding_intent, and for address creation (push+write
+    // precedes CreateUnicastIpAddressEntry). So a torn pending file can never be
+    // the sole record of committed intent -- the base is always at least as
+    // informed, and an empty file is not a record at all.
+    //
+    // A NON-empty torn pending file still blocks recovery, exactly as before: it
+    // may hold intent that the base lacks, and the original safety argument for
+    // that case stands.
+    // =============================================================================
+
     fn read(&self) -> io::Result<Option<Record>> {
         let base = self.store.native_path();
         let pending = base.with_extension("next");
-        // A flushed pending update can contain newer mutation intent than the base.
-        // An incomplete pending file blocks recovery rather than losing that intent.
+        // A flushed pending update can contain newer mutation intent than the
+        // base. An incomplete non-empty pending file blocks recovery rather
+        // than losing that intent. An EMPTY one encodes no intent, so it is
+        // discarded: it cannot authorise anything, and leaving it in place
+        // would also wedge write(), whose create_new refuses an existing path.
         let path = match fs::symlink_metadata(&pending) {
+            Ok(m) if m.is_file() && m.len() == 0 && m.file_attributes() & 0x400 == 0 => {
+                fs::remove_file(&pending)?;
+                base
+            }
             Ok(_) => pending,
             Err(e) if e.kind() == io::ErrorKind::NotFound => base,
             Err(e) => return Err(e),
@@ -167,11 +207,11 @@ impl NativeHost {
         }
         let mut bytes = Vec::new();
         OpenOptions::new()
-            .read(true)
-            .share_mode(1)
-            .open(path)?
-            .take(16385)
-            .read_to_end(&mut bytes)?;
+        .read(true)
+        .share_mode(1)
+        .open(path)?
+        .take(16385)
+        .read_to_end(&mut bytes)?;
         if bytes.len() > 16384 {
             return Err(io::Error::other("native_record_size"));
         }
@@ -179,6 +219,31 @@ impl NativeHost {
         r.validate()?;
         Ok(Some(r))
     }
+
+    // =============================================================================
+    // NOTES
+    //
+    // * The reparse-point guard (0x400) is kept on the removal path too: a junction
+    //   named native-gateway.next must not be followed or deleted.
+    //
+    // * Removal failure propagates deliberately. If the file is held open by a
+    //   live helper (write() opens it with share_mode(0)), that helper may be
+    //   mid-write, so refusing to proceed is the honest outcome.
+    //
+    // * Optional, NOT required: write() could also unlink a stale pending file
+    //   before create_new. read() now clears it on the recovery path, which is the
+    //   one that matters, so I would leave write() alone.
+    //
+    // * This is a pre-existing fork bug, unrelated to the UDP relay work. Our patch
+    //   set touches native_gateway.ps1 only; native_gateway.rs was unmodified.
+    //
+    // * Deployment note visible in the stranded record: it pinned
+    //   program = C:\Users\Owner\Downloads\p2-middleware-v0.1.0-windows-x64\
+    //   p2-bridge.exe. Both the record and the firewall rule pin that absolute
+    //   path, so replacing binaries in a DIFFERENT folder while a record survives
+    //   would fail the ownership check on the remove path. Keep all three exes in
+    //   one folder and overwrite in place when upgrading.
+    // =============================================================================
     fn write(&self, r: &Record) -> io::Result<()> {
         r.validate()?;
         let path = self.store.native_path();

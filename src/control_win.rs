@@ -119,7 +119,7 @@ struct PipeSecurity {
 impl PipeSecurity {
     fn new() -> io::Result<Self> {
         let sid = user_sid()?;
-        let mut sddl: Vec<u16> = format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{sid})")
+        let sddl: Vec<u16> = format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{sid})")
         .encode_utf16()
         .chain([0])
         .collect();

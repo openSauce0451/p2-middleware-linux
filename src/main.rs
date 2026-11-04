@@ -8,6 +8,8 @@ use p2_middleware::{
     network::{self, Adapter},
     RouteClient,
 };
+#[cfg(target_os = "linux")]
+use p2_middleware::tunnel_setup;
 use qrcode::{render::unicode, QrCode};
 use std::{
     sync::mpsc::{self, Receiver},
@@ -186,8 +188,13 @@ impl App {
         style.spacing.button_padding = egui::vec2(14.0, 8.0);
         cc.egui_ctx.set_style(style);
 
+        // Splice 1: Module import already added above (use p2_middleware::tunnel_setup;)
+
         let mut app = Self {
-            settings: Settings::load().unwrap_or_default(),
+            settings: Settings::load().unwrap_or_else(|e| {
+                eprintln!("[settings] LOAD FAILED ({e}) — using defaults; existing file NOT overwritten unless you save");
+                Settings::default()
+            }),
             adapters: vec![],
             selected: None,
             discovery: None,
@@ -213,6 +220,16 @@ impl App {
 
         if let Some(ip) = ps3 {
             app.settings.ps3_ip = ip;
+        }
+
+        // Splice 2: Orphan recovery for crashed previous sessions (Linux-only)
+        #[cfg(target_os = "linux")]
+        {
+            use std::path::Path;
+            if Path::new(tunnel_setup::STATE).exists() {
+                eprintln!("[startup] recovering stale tunnel alias from previous session");
+                tunnel_setup::remove_journalled();
+            }
         }
 
         app.discover();
@@ -283,6 +300,9 @@ impl App {
         if let Some(route) = &mut self.route {
             route.reset();
         }
+        // Splice 4a: Teardown tunnel alias on reset
+        #[cfg(target_os = "linux")]
+        tunnel_setup::remove_journalled();
     }
 
     fn forget(&mut self) {
@@ -338,6 +358,11 @@ Check the PS3 address, or pass --iface explicitly."
             self.note(e);
             return false;
         }
+        if let Err(e) = Settings::load() {
+            eprintln!("[headless] refusing to save over unreadable settings: {e}");
+            self.note("Existing settings are invalid; fix the file before continuing.");
+            return false;
+        }
         if self.settings.save().is_err() {
             self.note("Could not save the PS3 address.");
             return false;
@@ -346,12 +371,41 @@ Check the PS3 address, or pass --iface explicitly."
         match iface_index(&iface) {
             Some(idx) => {
                 println!("[headless] interface {iface} (index {idx}), {pc_ip}/{prefix}, router {router}");
-                self.headless_iface = Some((iface, idx));
+                self.headless_iface = Some((iface.clone(), idx));
             }
             None => {
                 eprintln!("[headless] could not read the kernel index for {iface}");
                 self.note("Could not resolve the interface index.");
                 return false;
+            }
+        }
+
+        // Splice 3: Create tunnel alias if [tunnel] config exists
+        #[cfg(target_os = "linux")]
+        if let Some(ref t) = self.settings.tunnel {
+            let remote = match t.remote_ps3.parse::<std::net::Ipv4Addr>() {
+                Ok(ip) => ip,
+                Err(_) => {
+                    eprintln!(
+                        "[headless] invalid remote_ps3 in settings: '{}' — \
+check [tunnel] in settings.toml",
+t.remote_ps3
+                    );
+                    self.note(format!(
+                        "Tunnel config invalid: remote_ps3 '{}' is not an IPv4 address.",
+                        t.remote_ps3
+                    ));
+                    return false;
+                }
+            };
+
+            if let Err(e) = tunnel_setup::ensure_alias(remote, &iface) {
+                let manual_cmd = format!("sudo ip addr add {}/32 dev {}", t.remote_ps3, iface);
+                eprintln!("[headless] tunnel alias failed: {e}. Manual: {manual_cmd}");
+                self.note(format!("Tunnel alias unavailable. Manual: {manual_cmd}"));
+                // Non-fatal: ps3_tunnel's binder retries, so a manually-created alias still works.
+            } else {
+                println!("[headless] tunnel alias created: {}/32 on {}", t.remote_ps3, iface);
             }
         }
 
@@ -774,6 +828,9 @@ impl Drop for App {
         if let Some(pending) = &self.approval {
             pending.cancel();
         }
+        // Splice 4b: Teardown tunnel alias on App drop
+        #[cfg(target_os = "linux")]
+        tunnel_setup::remove_journalled();
     }
 }
 

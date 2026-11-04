@@ -4,6 +4,7 @@ pub mod config;
 pub mod network;
 pub mod request;
 pub mod session;          // no longer Windows-gated
+pub mod tunnel_setup;
 
 mod control_common;
 pub mod control;

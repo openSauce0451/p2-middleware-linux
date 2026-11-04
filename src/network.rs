@@ -104,6 +104,7 @@ pub fn for_console<'a>(adapters: &'a [Adapter], ps3: &str) -> Result<&'a Adapter
                     router_ip: a.gateway.clone(),
                     prefix_len: a.prefix,
                     crossplay: true,
+                    tunnel: None,
                 }
                 .validate()
                 .is_ok()

@@ -8,17 +8,21 @@
 //! * nftables cannot match an executable path, so the Windows rule's `-Program`
 //!   clause has no direct analogue; matching is by interface, source and port.
 //! * Lifetimes use `valid_lft`/`preferred_lft`, refreshed on the same 60s tick.
+//! * Exclusion between helper instances uses an OS-backed flock
+//!   (`JournalStore::lock`), not the Windows `share_mode(0)` trick; flock is
+//!   released by the kernel when the holder dies, so a crashed helper can
+//!   never strand the lock (the fatal flaw of an existence-check lockfile).
 
 use crate::{
-    journal_linux::{atomic_replace, JournalStore},
+    journal_linux::{atomic_replace, JournalLock, JournalStore},
     request::Request,
     session::Network,
 };
 use p2_bridge_core::legacy_cm::LEGACY_CM;
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
-    io,
+    fs::{self, OpenOptions},
+    io::{self, Write},
     net::Ipv4Addr,
     process::Command,
     time::{Duration, Instant},
@@ -123,23 +127,54 @@ fn set_forwarding(iface: &str, on: bool) -> io::Result<()> {
 
 pub struct NativeHost {
     store: JournalStore,
+    // Held for the struct's entire lifetime: acquired at session start,
+    // released on drop at session end. While this guard lives, no other
+    // helper instance can acquire it — the recovery-vs-live-session race
+    // is closed at the only place both sides touch the journal.
+    #[allow(dead_code)] // see comment: the field is never read, only held
+    guard: JournalLock,
     renewed: Option<Instant>,
     failed: bool,
 }
 
 impl NativeHost {
-    pub fn new(store: JournalStore) -> Self {
-        Self { store, renewed: None, failed: false }
+    /// Fallible now: acquiring the journal lock can fail, and that failure
+    /// is information the caller must surface (second live instance, or an
+    /// I/O error). The caller maps this to the `store_unavailable` event.
+    pub fn new(store: JournalStore) -> io::Result<Self> {
+        let guard = store.lock().map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                           format!("journal lock unavailable: {e}"),
+            )
+        })?;
+        Ok(Self { store, guard, renewed: None, failed: false })
     }
 
     fn read(&self) -> io::Result<Option<Record>> {
         let base = self.store.native_path();
         let pending = base.with_extension("next");
-        let path = if pending.exists() { pending } else { base };
+        // Torn-write recovery (mirrors the Windows fix): a zero-length
+        // pending file encodes no mutation intent — every network side
+        // effect in this file happens only AFTER write() durably landed in
+        // the base — so discarding it loses nothing, while keeping it
+        // wedges both read (JSON parse of nothing) and write (create_new
+        // refuses the occupied path). A NON-empty pending still wins: it
+        // may hold intent the base lacks.
+        let path = match fs::symlink_metadata(&pending) {
+            Ok(m) if m.is_file() && m.len() == 0 => {
+                fs::remove_file(&pending)?;
+                base
+            }
+            Ok(_) => pending,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => base,
+            Err(e) => return Err(e),
+        };
         match fs::read(&path) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
             Ok(bytes) if bytes.len() > 16384 => Err(io::Error::other("native_record_size")),
+            Ok(bytes) if bytes.is_empty() => Err(io::Error::other("native_record_torn")),
             Ok(bytes) => {
                 let r: Record = serde_json::from_slice(&bytes)?;
                 r.validate()?;
@@ -152,7 +187,19 @@ impl NativeHost {
         r.validate()?;
         let path = self.store.native_path();
         let next = path.with_extension("next");
-        fs::write(&next, serde_json::to_vec(r)?)?;
+        // Same discipline as the Windows side: write to the pending file,
+        // flush to disk, then rename over the base. fs::write() alone gave
+        // no durability barrier and truncated an existing pending in
+        // place; a crash between truncate and flush produced the zero-byte
+        // file the read() guard above now recovers from.
+        let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&next)?;
+        file.write_all(&serde_json::to_vec(r)?)?;
+        file.sync_all()?;
+        drop(file);
         atomic_replace(&next, &path)
     }
 
