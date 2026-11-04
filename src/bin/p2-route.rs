@@ -74,6 +74,6 @@ async fn serve(stream: &mut Channel) -> Result<(), &'static str> {
     // network/journalling modules, or the Windows IpHelper address aliases
     // plus the firewall-record journal. Both implement `session::Network`.
     let store = JournalStore::open().map_err(|_| "store_unavailable")?;
-    let mut host = NativeHost::new(store);
+    let mut host = NativeHost::new(store).map_err(|_| "store_unavailable")?;
     session::run(stream, lines, &mut host).await
 }
