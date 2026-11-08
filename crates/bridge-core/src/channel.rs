@@ -17,6 +17,7 @@ use std::{
 use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
 const MAX_FRAME: usize = crate::protocol::MAX_MESSAGE + 32;
+#[derive(Clone)]
 pub struct Envelope {
     key: [u8; 32],
     hmac: bool,
