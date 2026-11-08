@@ -1,5 +1,5 @@
 //! Windows host operations. System changes are only reachable through the gated route helper.
-use crate::{network::hidden};
+use crate::network::hidden;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
 use std::{

@@ -16,7 +16,7 @@ use std::{
 
 use tokio::net::{UnixListener, UnixStream};
 
-pub use crate::control_common::{runtime, Lines, send};
+pub use crate::control_common::{runtime, send, Lines};
 
 /// `sun_path` is 108 bytes including the NUL terminator.
 const MAX_PATH: usize = 100;
@@ -69,11 +69,11 @@ pub fn validate_name(name: &str, parent: u32) -> io::Result<()> {
     };
     let prefix = format!("p2-{parent}-");
     let valid = parent != 0
-    && path.is_absolute()
-    && file
-    .strip_prefix(&prefix)
-    .and_then(|s| s.strip_suffix(".sock"))
-    .is_some_and(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()));
+        && path.is_absolute()
+        && file
+            .strip_prefix(&prefix)
+            .and_then(|s| s.strip_suffix(".sock"))
+            .is_some_and(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()));
     if valid {
         Ok(())
     } else {
@@ -88,10 +88,10 @@ fn peer_credentials(stream: &UnixStream) -> io::Result<(u32, u32, u32)> {
     let rc = unsafe {
         libc::getsockopt(
             stream.as_raw_fd(),
-                         libc::SOL_SOCKET,
-                         libc::SO_PEERCRED,
-                         (&mut cred as *mut libc::ucred).cast(),
-                         &mut len,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
         )
     };
     if rc != 0 {
@@ -125,8 +125,8 @@ fn verify_uid(stream: &UnixStream, expected: u32) -> io::Result<()> {
 pub fn verify_server(stream: &UnixStream, parent: u32) -> io::Result<()> {
     let (pid, uid, _) = peer_credentials(stream)?;
     let expected_uid = std::env::var("PKEXEC_UID")
-    .ok()
-    .and_then(|v| v.parse::<u32>().ok());
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok());
     let uid_ok = expected_uid.is_none_or(|expected| expected == uid);
     if pid == parent && uid_ok {
         Ok(())

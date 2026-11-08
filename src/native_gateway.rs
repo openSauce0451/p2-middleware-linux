@@ -1,4 +1,48 @@
 //! Native TCP delivery via fixed legacy CM /32 addresses. No packet driver.
+//!
+//! REVISION — TUNNEL ALIAS SUPPORT (drops in over the previous file).
+//!
+//! WHAT CHANGED:
+//!   * `Record` gains `tunnel_remote: Option<Ipv4Addr>` (serde-defaulted, so
+//!     stranded schema-1 journals still parse and still recover). New records
+//!     are written as schema 2; validate() accepts 1 or 2.
+//!   * `validate()` allows ONE address beyond the LEGACY_CM set: the remote
+//!     console's /32 alias, which must match `tunnel_remote`. The LEGACY_CM
+//!     entries are still checked positionally over the first
+//!     min(len, LEGACY_CM.len()) slots so the incremental push->write->create
+//!     sequence keeps validating at every step.
+//!   * `activate()` calls `settings.tunnel_plan()` up front. A present-but-
+//!     invalid tunnel config fails LOUDLY here (same all-or-nothing rule as
+//!     Bridge::start) instead of producing a gateway that cannot support the
+//!     tunnel the bridge is about to be launched with. Mirrors bridge.rs's
+//!     overlap guard: remote must differ from plan.ps3 and plan.pc.
+//!   * The alias itself is created with the exact same durable-first pattern
+//!     as the LEGACY_CM addresses: push Address{created:None} + write BEFORE
+//!     CreateUnicastIpAddressEntry, then journal CreationTimeStamp after the
+//!     row exists. Because it is appended to `r.addresses`, the existing DAD
+//!     wait, `renew()` and `restore()` loops cover it with no further changes —
+//!     teardown, crash recovery and lifetime renewal are inherited for free.
+//!   * Field values mirror the Linux side's `ip addr replace <remote>/32`:
+//!     OnLinkPrefixLength 32, manual prefix/suffix origin, SkipAsSource true
+//!     (inbound delivery and explicit binds are unaffected; only source
+//!     address selection for locally originated traffic is excluded).
+//!
+//! WHAT DID NOT CHANGE: read()'s empty-pending-file recovery fix, write()/
+//! clear(), the LIFETIME/RENEW constants, firewall and forwarding intents,
+//! Job/journal ownership rules, and everything else byte-for-byte.
+//!
+//! REMAINING EXTERNAL REQUIREMENTS (outside this file):
+//!   * The Windows side's settings.toml must actually contain a [tunnel]
+//!     section with valid remote_ps3 / wire_peer / key — the GUI does not
+//!     write it yet; hand-edit %LOCALAPPDATA%/P2Middleware/settings.toml.
+//!   * Both peers must run the same app revision (config.rs uses
+//!     deny_unknown_fields: a Rev 3 `port_band` key makes an older app fail
+//!     to load settings).
+//!   * UDP reachability on wire_port (default 27050) between the two peers:
+//!     NAT forward or hole-punch. The native_rule_add firewall rule is
+//!     program-scoped to p2-bridge.exe, so the wire socket is covered, but
+//!     verify the rule pins the CURRENT binary folder (path-pinned rules
+//!     break after moving/upgrading into a different directory).
 use crate::{
     session::Network,
     windows_host::{self, JournalStore, Request},
@@ -66,6 +110,8 @@ struct Address {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Record {
+    // Schema 1: legacy records without tunnel support (still recovered fine).
+    // Schema 2: adds tunnel_remote. Accepted values: 1 or 2.
     schema: u8,
     index: u32,
     luid: u64,
@@ -77,11 +123,16 @@ struct Record {
     firewall_intent: bool,
     forwarding_intent: bool,
     addresses: Vec<Address>,
+    /// Remote console address aliased onto the adapter for the gameplay
+    /// tunnel. None = no tunnel this session. Serde-defaulted so stranded
+    /// schema-1 journals parse and recover unchanged.
+    #[serde(default)]
+    tunnel_remote: Option<Ipv4Addr>,
 }
 impl Record {
     fn validate(&self) -> io::Result<()> {
         let suffix = self.name.strip_prefix("p2-middleware-").unwrap_or("");
-        if self.schema != 1
+        if !matches!(self.schema, 1 | 2)      // was: self.schema != 1 || self.schema == 0
             || self.index == 0
             || self.luid == 0
             || !self.local.is_private()
@@ -91,14 +142,41 @@ impl Record {
             || suffix.len() != 16
             || !suffix.bytes().all(|b| b.is_ascii_hexdigit())
             || (self.previous_forwarding && self.forwarding_intent)
-            || self.addresses.len() > LEGACY_CM.len()
-            || self
-                .addresses
-                .iter()
-                .zip(LEGACY_CM)
-                .any(|(a, expected)| a.ip != expected)
         {
             return Err(io::Error::other("native_record_invalid"));
+        }
+        // Schema: 1 = pre-tunnel record, 2 = with tunnel_remote. Both parse;
+        // only 2 is written from now on.
+        if self.schema != 1 && self.schema != 2 {
+            return Err(io::Error::other("native_record_invalid"));
+        }
+        // Address bookkeeping: the LEGACY_CM set, positionally, plus at most
+        // ONE trailing entry — the remote console alias, which must match
+        // tunnel_remote. Fewer than LEGACY_CM is legal: activate() persists
+        // the record incrementally as addresses are created.
+        if self.addresses.len() > LEGACY_CM.len() + 1 {
+            return Err(io::Error::other("native_record_invalid"));
+        }
+        let legacy_slots = self.addresses.len().min(LEGACY_CM.len());
+        if self.addresses[..legacy_slots]
+            .iter()
+            .zip(LEGACY_CM)
+            .any(|(a, expected)| a.ip != expected)
+        {
+            return Err(io::Error::other("native_record_invalid"));
+        }
+        if self.addresses.len() == LEGACY_CM.len() + 1 {
+            match self.tunnel_remote {
+                Some(remote)
+                    if remote.is_private()
+                        && remote != self.local
+                        && remote != self.peer
+                        && self.addresses[LEGACY_CM.len()].ip == remote =>
+                {
+                    ()
+                }
+                _ => return Err(io::Error::other("native_record_invalid")),
+            }
         }
         Ok(())
     }
@@ -135,6 +213,9 @@ impl NativeHost {
             .read()?
             .ok_or_else(|| io::Error::other("native_record_missing"))?;
         for a in &r.addresses {
+            // Covers LEGACY_CM entries AND the trailing tunnel alias: both
+            // live in r.addresses, so lifetime renewal and ownership checks
+            // need no special-casing.
             let mut row = lookup(r.row(a.ip))
                 .map_err(io::Error::other)?
                 .ok_or_else(|| io::Error::other("address_missing"))?;
@@ -151,36 +232,11 @@ impl NativeHost {
         Ok(())
     }
     // =============================================================================
-    // FIX — src/native_gateway.rs, NativeHost::read()
+    // (UNCHANGED FIX) — empty `native-gateway.next` recovery.
     //
-    // Replace the existing `let path = match fs::symlink_metadata(&pending) {...}`
-    // block with the version below. Nothing else in the file changes.
-    //
-    // WHY THIS IS NEEDED
-    //
-    // A zero-length `native-gateway.next` is a torn write: the helper died between
-    // create_new and the first flush. read() preferred that file, parsed zero
-    // bytes, failed, and restore() surfaced recovery_incomplete -- while write()'s
-    // create_new refused the existing path, so the store could neither be read nor
-    // rewritten. Recovery was impossible by construction, on every launch, forever.
-    //
-    // WHY DROPPING AN EMPTY PENDING FILE LOSES NOTHING
-    //
-    // Every network side effect is performed only AFTER the record that authorises
-    // it is durable in the base file:
-    //
-    //     r.firewall_intent = true;
-    //     self.write(&r)?;                                  // durable first
-    //     windows_host::command("native_rule_add", ..)?;    // side effect second
-    //
-    // The same holds for forwarding_intent, and for address creation (push+write
-    // precedes CreateUnicastIpAddressEntry). So a torn pending file can never be
-    // the sole record of committed intent -- the base is always at least as
-    // informed, and an empty file is not a record at all.
-    //
-    // A NON-empty torn pending file still blocks recovery, exactly as before: it
-    // may hold intent that the base lacks, and the original safety argument for
-    // that case stands.
+    // A zero-length pending file is a torn write between create_new and the
+    // first flush; it encodes no intent, so it is discarded. A NON-empty torn
+    // pending file still blocks recovery, exactly as before.
     // =============================================================================
 
     fn read(&self) -> io::Result<Option<Record>> {
@@ -207,11 +263,11 @@ impl NativeHost {
         }
         let mut bytes = Vec::new();
         OpenOptions::new()
-        .read(true)
-        .share_mode(1)
-        .open(path)?
-        .take(16385)
-        .read_to_end(&mut bytes)?;
+            .read(true)
+            .share_mode(1)
+            .open(path)?
+            .take(16385)
+            .read_to_end(&mut bytes)?;
         if bytes.len() > 16384 {
             return Err(io::Error::other("native_record_size"));
         }
@@ -223,26 +279,16 @@ impl NativeHost {
     // =============================================================================
     // NOTES
     //
-    // * The reparse-point guard (0x400) is kept on the removal path too: a junction
-    //   named native-gateway.next must not be followed or deleted.
+    // * The reparse-point guard (0x400) is kept on the removal path too: a
+    //   junction named native-gateway.next must not be followed or deleted.
     //
     // * Removal failure propagates deliberately. If the file is held open by a
     //   live helper (write() opens it with share_mode(0)), that helper may be
     //   mid-write, so refusing to proceed is the honest outcome.
     //
-    // * Optional, NOT required: write() could also unlink a stale pending file
-    //   before create_new. read() now clears it on the recovery path, which is the
-    //   one that matters, so I would leave write() alone.
-    //
-    // * This is a pre-existing fork bug, unrelated to the UDP relay work. Our patch
-    //   set touches native_gateway.ps1 only; native_gateway.rs was unmodified.
-    //
-    // * Deployment note visible in the stranded record: it pinned
-    //   program = C:\Users\Owner\Downloads\p2-middleware-v0.1.0-windows-x64\
-    //   p2-bridge.exe. Both the record and the firewall rule pin that absolute
-    //   path, so replacing binaries in a DIFFERENT folder while a record survives
-    //   would fail the ownership check on the remove path. Keep all three exes in
-    //   one folder and overwrite in place when upgrading.
+    // * Deployment note visible in the stranded record: both the record and
+    //   the firewall rule pin the ABSOLUTE p2-bridge.exe path. Overwrite
+    //   binaries in place when upgrading; a different folder fails ownership.
     // =============================================================================
     fn write(&self, r: &Record) -> io::Result<()> {
         r.validate()?;
@@ -296,6 +342,8 @@ impl NativeHost {
                 .is_err();
             }
         }
+        // Deletes LEGACY_CM entries AND the tunnel alias (both in addresses),
+        // so a crashed tunnel session cannot leak the remote console address.
         for a in &r.addresses {
             let result = (|| -> io::Result<()> {
                 if let Some(row) = lookup(r.row(a.ip)).map_err(io::Error::other)? {
@@ -325,6 +373,26 @@ impl NativeHost {
             return Err(io::Error::other("recovery_required"));
         }
         let plan = request.settings.validate().map_err(io::Error::other)?;
+        // -------------------------------------------------------------------------
+        // TUNNEL PLAN (all-or-nothing, mirrors Bridge::start):
+        //   * tunnel absent -> None, everything below behaves exactly as before;
+        //   * tunnel present but invalid -> hard error HERE, so the gateway is
+        //     never activated without the alias the bridge session will need;
+        //   * tunnel remote overlapping our own ps3/pc -> hard error, same
+        //     "check which PS3 is which" meaning as bridge.rs.
+        // The PSK/wire fields are validated but NOT touched by the helper: only
+        // the remote address needs an alias on this adapter. serve() consumes
+        // the rest via the --tunnel-* flags.
+        // -------------------------------------------------------------------------
+        let tunnel = match &request.settings.tunnel {
+            None => None,
+            Some(_) => Some(request.settings.tunnel_plan().map_err(io::Error::other)?),
+        };
+        if let Some(t) = &tunnel {
+            if t.remote_ps3 == plan.ps3 || t.remote_ps3 == plan.pc {
+                return Err(io::Error::other("tunnel_remote_overlaps_local"));
+            }
+        }
         let state = windows_host::command(
             "interface",
             json!({"index":request.interface,"local":plan.pc}),
@@ -343,7 +411,8 @@ impl NativeHost {
         // Refuse an existing address on ANY interface, rather than taking ownership.
         windows_host::command("native_addresses_free", json!({"addresses":LEGACY_CM}))?;
         let mut r = Record {
-            schema: 1,
+            // Schema 2 = record carries optional tunnel_remote.
+            schema: 2,
             index: request.interface,
             luid: unsafe { primary.InterfaceLuid.Value },
             local: plan.pc,
@@ -359,6 +428,7 @@ impl NativeHost {
             firewall_intent: false,
             forwarding_intent: false,
             addresses: vec![],
+            tunnel_remote: tunnel.as_ref().map(|t| t.remote_ps3),
         };
         self.write(&r)?;
         let result = (|| -> io::Result<()> {
@@ -366,6 +436,48 @@ impl NativeHost {
                 r.addresses.push(Address { ip, created: None });
                 self.write(&r)?;
                 let mut row = r.row(ip);
+                row.OnLinkPrefixLength = 32;
+                row.SkipAsSource = true;
+                row.PrefixOrigin = IpPrefixOriginManual;
+                row.SuffixOrigin = IpSuffixOriginManual;
+                row.ValidLifetime = LIFETIME;
+                row.PreferredLifetime = LIFETIME;
+                let code = unsafe { CreateUnicastIpAddressEntry(&row) };
+                if code != 0 {
+                    return Err(io::Error::from_raw_os_error(code as i32));
+                }
+                r.addresses.last_mut().unwrap().created = Some(
+                    lookup(row)
+                        .map_err(io::Error::other)?
+                        .ok_or_else(|| io::Error::other("address_missing"))?
+                        .CreationTimeStamp,
+                );
+                self.write(&r)?;
+            }
+            // -----------------------------------------------------------------
+            // TUNNEL ALIAS — the remote console's private IP as a /32 on this
+            // adapter, exactly the Windows counterpart of tunnel_setup.rs's
+            // `ip addr replace <remote>/32` on Linux. Same durable-first
+            // order as the loop above: the record that authorises the address
+            // is on disk BEFORE CreateUnicastIpAddressEntry runs, and the
+            // CreationTimeStamp is journaled after the row exists.
+            //
+            // SkipAsSource mirrors the LEGACY_CM rows: inbound packets to the
+            // alias are still delivered and the bridge binds its sockets
+            // explicitly; we only keep Windows from picking the remote
+            // console's address as a SOURCE for unrelated outbound traffic.
+            //
+            // Appended LAST so validate()'s positional LEGACY_CM check and
+            // restore()/renew() iteration keep working untouched. The DAD
+            // wait below iterates r.addresses and therefore covers it.
+            // -----------------------------------------------------------------
+            if let Some(t) = &tunnel {
+                r.addresses.push(Address {
+                    ip: t.remote_ps3,
+                    created: None,
+                });
+                self.write(&r)?;
+                let mut row = r.row(t.remote_ps3);
                 row.OnLinkPrefixLength = 32;
                 row.SkipAsSource = true;
                 row.PrefixOrigin = IpPrefixOriginManual;

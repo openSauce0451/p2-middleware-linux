@@ -1,4 +1,5 @@
 use crate::{config::Settings, network::hidden};
+use base64::{engine::general_purpose::STANDARD, Engine};
 use p2_bridge_core::gateway::Authorization;
 use std::{
     io::{self, BufRead, Write},
@@ -11,7 +12,6 @@ use std::{
     thread,
 };
 use zeroize::Zeroizing;
-use base64::{engine::general_purpose::STANDARD, Engine};
 
 pub struct Bridge {
     child: Child,
@@ -59,8 +59,9 @@ impl Bridge {
         let tunnel_args: Vec<String> = match &settings.tunnel {
             None => vec![],
             Some(_) => {
-                let tunnel = settings.tunnel_plan()
-                .map_err(|_| io::Error::other("tunnel_settings_invalid"))?;
+                let tunnel = settings
+                    .tunnel_plan()
+                    .map_err(|_| io::Error::other("tunnel_settings_invalid"))?;
                 // Re-validate against the LAN plan we already computed: the
                 // remote PS3 must not collide with our own network devices.
                 if tunnel.remote_ps3 == plan.ps3 || tunnel.remote_ps3 == plan.pc {
@@ -84,6 +85,10 @@ impl Bridge {
                     args.push("--tunnel-band".to_string());
                     args.push(format!("{first}-{last}"));
                 }
+                if let Some(port) = tunnel.advertised_port {
+                    args.push("--tunnel-advertised-port".to_string());
+                    args.push(port.to_string());
+                }
                 args
             }
         };
@@ -105,32 +110,32 @@ impl Bridge {
             "true",
             "--peer",
             &plan.ps3.to_string(),
-                     "--seconds",
-                     "86400",
-                     "--sessions",
-                     "1000",
-                     "--search-platform",
-                     if settings.crossplay {
-                         "any"
-                     } else {
-                         "preserve"
-                     },
-                     "--search-distance",
-                     "worldwide",
-                     "--advertise-platform",
-                     if settings.crossplay {
-                         "default"
-                     } else {
-                         "preserve"
-                     },
+            "--seconds",
+            "86400",
+            "--sessions",
+            "1000",
+            "--search-platform",
+            if settings.crossplay {
+                "any"
+            } else {
+                "preserve"
+            },
+            "--search-distance",
+            "worldwide",
+            "--advertise-platform",
+            if settings.crossplay {
+                "default"
+            } else {
+                "preserve"
+            },
         ]);
         if !tunnel_args.is_empty() {
             command.args(&tunnel_args);
         }
         command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
         hidden(&mut command);
         #[cfg(windows)]
         let job = Job::new()?;
@@ -144,9 +149,9 @@ impl Bridge {
         let payload = Zeroizing::new(serde_json::to_vec(auth)?);
         let sent = (|| -> io::Result<()> {
             let mut input = child
-            .stdin
-            .take()
-            .ok_or_else(|| io::Error::other("Missing private pipe"))?;
+                .stdin
+                .take()
+                .ok_or_else(|| io::Error::other("Missing private pipe"))?;
             input.write_all(&payload)?;
             input.write_all(b"\n")
         })();
@@ -168,14 +173,14 @@ impl Bridge {
                 if serde_json::from_str::<serde_json::Value>(&line)
                     .ok()
                     .is_some_and(|v| v["event"] == "listening")
-                    {
-                        worker_ready.store(true, Ordering::Release);
+                {
+                    worker_ready.store(true, Ordering::Release);
+                }
+                if let Some(message) = friendly_event(&line) {
+                    if tx.send(message.into()).is_err() {
+                        break;
                     }
-                    if let Some(message) = friendly_event(&line) {
-                        if tx.send(message.into()).is_err() {
-                            break;
-                        }
-                    }
+                }
             }
         });
         Ok(Self {
@@ -268,7 +273,9 @@ fn friendly_event(line: &str) -> Option<&'static str> {
         // P2_DEBUG_BRIDGE raw dump only, matching how the UDP relay's
         // per-flow events are treated.
         "tunnel_started" => Some("The gameplay tunnel is connected."),
-        "tunnel_alias_absent" => Some("The tunnel could not bind the remote PS3 address. Create the alias, then retry."),
+        "tunnel_alias_absent" => {
+            Some("The tunnel could not bind the remote PS3 address. Create the alias, then retry.")
+        }
         _ => None,
     }
 }
@@ -291,7 +298,7 @@ impl Job {
                 handle,
                 JobObjectExtendedLimitInformation,
                 (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-                                    std::mem::size_of_val(&limits) as u32,
+                std::mem::size_of_val(&limits) as u32,
             )
         };
         if ok == 0 {

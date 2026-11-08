@@ -49,12 +49,12 @@ impl JournalStore {
     pub(crate) fn lock(&self) -> io::Result<JournalLock> {
         let path = self.dir.join("owner.lock");
         let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(&path)?;
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)?;
         // `.mode()` is masked by umask and applies only at creation; this
         // also repairs a lock file left readable by an older build.
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
@@ -98,7 +98,7 @@ pub fn atomic_replace(from: &Path, to: &Path) -> io::Result<()> {
     fs::rename(from, to).map_err(|e| {
         io::Error::new(
             e.kind(),
-                       format!("Failed to atomically replace {}: {}", to.display(), e),
+            format!("Failed to atomically replace {}: {}", to.display(), e),
         )
     })
 }

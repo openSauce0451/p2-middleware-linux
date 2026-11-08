@@ -86,6 +86,15 @@ pub struct TunnelSettings {
     /// Optional band of extra alias ports (see PortBand). None = single port.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port_band: Option<PortBand>,
+    #[serde(default)]
+    pub catch_all_port: Option<u16>,
+    /// Rev 7: public UDP port the peer should dial — the VPN provider's
+    /// assigned forwarded port. None = wire_port is already public.
+    #[serde(default)]
+    pub advertised_port: Option<u16>,
+    /// Pin for Binding-Response advertisement (Fix 2c). None = auto-detect.
+    #[serde(default)]
+    pub stun_advertise: Option<String>, // parse lazily to SocketAddr on load
 }
 impl Default for TunnelSettings {
     fn default() -> Self {
@@ -96,8 +105,18 @@ impl Default for TunnelSettings {
             wire_peer: String::new(),
             key: String::new(),
             port_band: None,
+            catch_all_port: None,
+            advertised_port: None,
+            stun_advertise: None,
         }
     }
+}
+
+pub struct StunSettings {
+    pub enabled: bool,
+    pub probe_ports: Vec<u16>,
+    /// Answer TURN Allocate requests with a relay allocation (Fix 1).
+    pub relay_allocations: bool,
 }
 
 pub struct NetworkPlan {
@@ -115,6 +134,8 @@ pub struct TunnelPlan {
     pub key: [u8; 32],
     /// Validated inclusive band, or None for legacy single-port behaviour.
     pub port_band: Option<(u16, u16)>,
+    pub catch_all_port: Option<u16>,
+    pub advertised_port: Option<u16>,
 }
 impl Settings {
     pub fn validate(&self) -> Result<NetworkPlan, &'static str> {
@@ -123,9 +144,9 @@ impl Settings {
         // saving the basic LAN settings.
         let parse = |s: &str| {
             s.trim()
-            .parse::<Ipv4Addr>()
-            .ok()
-            .filter(|ip| ip.is_private())
+                .parse::<Ipv4Addr>()
+                .ok()
+                .filter(|ip| ip.is_private())
         };
         let ps3 = parse(&self.ps3_ip).ok_or("Enter the PS3's private IPv4 address.")?;
         let pc = parse(&self.pc_ip).ok_or("Select this PC's private IPv4 address.")?;
@@ -156,12 +177,12 @@ impl Settings {
     pub fn tunnel_plan(&self) -> Result<TunnelPlan, &'static str> {
         let t = self.tunnel.as_ref().ok_or("No tunnel settings.")?;
         let remote_ps3 = t
-        .remote_ps3
-        .trim()
-        .parse::<Ipv4Addr>()
-        .ok()
-        .filter(|ip| ip.is_private())
-        .ok_or("Enter the other PS3's private IPv4 address.")?;
+            .remote_ps3
+            .trim()
+            .parse::<Ipv4Addr>()
+            .ok()
+            .filter(|ip| ip.is_private())
+            .ok_or("Enter the other PS3's private IPv4 address.")?;
         if !(1..=65535).contains(&t.remote_port) {
             return Err("Enter the other PS3's game port.");
         }
@@ -172,12 +193,13 @@ impl Settings {
         // The wire peer must be a public endpoint; a private/loopback value
         // is a misconfiguration (leftover from copying the LAN addresses).
         let wire_peer = t
-        .wire_peer
-        .trim()
-        .parse::<std::net::SocketAddr>()
-        .map_err(|_| "Enter the other PC's public address as ip:port.")?;
+            .wire_peer
+            .trim()
+            .parse::<std::net::SocketAddr>()
+            .map_err(|_| "Enter the other PC's public address as ip:port.")?;
         match wire_peer.ip() {
-            std::net::IpAddr::V4(ip) if !ip.is_private() && !ip.is_loopback() && !ip.is_unspecified() => {}
+            std::net::IpAddr::V4(ip)
+                if !ip.is_private() && !ip.is_loopback() && !ip.is_unspecified() => {}
             _ => return Err("The tunnel peer must be the other PC's public IPv4."),
         }
         if wire_peer.port() == 0 {
@@ -187,13 +209,18 @@ impl Settings {
         // is, the player confused the two consoles' networks and the alias
         // would collide with local routing.
         let mask = u32::MAX << (32 - self.prefix_len.min(31));
-        let own_net = self.pc_ip.trim().parse::<Ipv4Addr>().map(|ip| u32::from(ip) & mask).unwrap_or(0);
+        let own_net = self
+            .pc_ip
+            .trim()
+            .parse::<Ipv4Addr>()
+            .map(|ip| u32::from(ip) & mask)
+            .unwrap_or(0);
         if u32::from(remote_ps3) & mask == own_net {
             return Err("The remote PS3 address is on this LAN; check which PS3 is which.");
         }
         let key = STANDARD
-        .decode(t.key.trim())
-        .map_err(|_| "The tunnel key must be base64.")?;
+            .decode(t.key.trim())
+            .map_err(|_| "The tunnel key must be base64.")?;
         if key.len() != 32 {
             return Err("The tunnel key must be 32 bytes of base64.");
         }
@@ -228,6 +255,8 @@ impl Settings {
                 Some((first, last))
             }
         };
+        let catch_all_port = t.catch_all_port.or(Some(27051));
+        let advertised_port = t.advertised_port.filter(|p| (1..=65535).contains(p));
 
         Ok(TunnelPlan {
             remote_ps3,
@@ -236,22 +265,43 @@ impl Settings {
             wire_peer,
             key: material,
             port_band,
+            catch_all_port,
+            advertised_port,
         })
     }
 
     #[cfg(windows)]
     pub fn path() -> io::Result<PathBuf> {
         std::env::var_os("LOCALAPPDATA")
-        .map(|p| PathBuf::from(p).join("P2Middleware/settings.toml"))
-        .ok_or_else(|| io::Error::other("Windows local application folder is unavailable"))
+            .map(|p| PathBuf::from(p).join("P2Middleware/settings.toml"))
+            .ok_or_else(|| io::Error::other("Windows local application folder is unavailable"))
     }
     #[cfg(not(windows))]
     pub fn path() -> io::Result<PathBuf> {
-        let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .ok_or_else(|| io::Error::other("Could not locate a configuration directory"))?;
-        Ok(base.join("p2-middleware/settings.toml"))
+        let home: PathBuf = {
+            let sudo_home = || {
+                if nix::unistd::Uid::effective().is_root() {
+                    std::env::var_os("SUDO_USER").and_then(|u| {
+                        // Root via plain sudo: reconstruct the calling user's
+                        // XDG config dir — /home/<user>/.config — since HOME
+                        // has been reset to /root.
+                        let p = PathBuf::from("/home").join(&u).join(".config");
+                        p.exists().then_some(p)
+                    })
+                } else {
+                    None
+                }
+            };
+            match std::env::var_os("XDG_CONFIG_HOME") {
+                Some(x) => PathBuf::from(x),
+                None => sudo_home()
+                    .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+                    .ok_or_else(|| {
+                        io::Error::other("Could not locate a configuration directory")
+                    })?,
+            }
+        };
+        Ok(home.join("p2-middleware/settings.toml"))
     }
     pub fn load() -> io::Result<Self> {
         let p = Self::path()?;
@@ -274,25 +324,7 @@ impl Settings {
         let path = Self::path()?;
         std::fs::create_dir_all(path.parent().unwrap())?;
         let text = toml::to_string_pretty(self)
-        .map_err(|_| io::Error::other("Could not encode settings"))?;
+            .map_err(|_| io::Error::other("Could not encode settings"))?;
         std::fs::write(path, text)
     }
 }
-
-// NOTE on base64 dependency: unchanged from the previous revision —
-// validate the SHAPE here (decodes, 32 bytes); the decoded material flows
-// into TunnelPlan for serve()/Ps3Tunnel. The recommended alternative
-// remains available: keep the raw base64 string flowing through flags and
-// decode in bridge-core, avoiding the app-side base64 dependency entirely.
-// Whichever you chose originally still works; port_band does not touch it.
-//
-// WIRING (config.rs <-> tunnel): TunnelPlan.port_band feeds the
-// TunnelConfig construction wherever serve() builds it:
-//
-//     port_band: plan.port_band,          // Option<(u16, u16)> — same type
-//
-// CLI flags path: if the tunnel is started from flags rather than the
-// settings file (the --tunnel-* flags predating settings-based config),
-// either add a --tunnel-band "FIRST-LAST" pair or default port_band to
-// None there. Command-line override of settings is the natural long-term
-// design; keep the settings value as the fallback.

@@ -60,10 +60,18 @@ pub async fn run(
                     active = true;
                     event(pipe, "route_ready").await;
                 }
-                Err(_) => {
+                Err(e) => {
                     host.cleanup().map_err(|_| "recovery_incomplete")?;
+                    active = false;
                     event(pipe, "session_clean").await;
-                    event(pipe, "activation_failed").await;
+                    let _ = control::send(
+                        pipe,
+                        &serde_json::json!({
+                            "event": "activation_failed",
+                            "error": e.to_string()
+                        }),
+                    )
+                    .await;
                 }
             },
             _ => break,

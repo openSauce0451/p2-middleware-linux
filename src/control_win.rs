@@ -24,13 +24,13 @@ use tokio::net::windows::named_pipe::{
     ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
 };
 use windows_sys::Win32::{
-    Foundation::{LocalFree, HLOCAL, ERROR_PIPE_BUSY},
+    Foundation::{LocalFree, ERROR_PIPE_BUSY, HLOCAL},
     Security::{
         Authorization::{
             ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
             SDDL_REVISION_1,
         },
-        GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER, SECURITY_ATTRIBUTES,
+        GetTokenInformation, TokenUser, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
     },
     System::{
         Pipes::{GetNamedPipeClientProcessId, GetNamedPipeServerProcessId},
@@ -38,7 +38,7 @@ use windows_sys::Win32::{
     },
 };
 
-pub use crate::control_common::{runtime, Lines, send};
+pub use crate::control_common::{runtime, send, Lines};
 
 fn bad_name() -> io::Error {
     io::Error::other("invalid_pipe_name")
@@ -59,9 +59,9 @@ pub fn validate_name(name: &str, parent: u32) -> io::Result<()> {
     let file = name.strip_prefix(ROOT).ok_or_else(bad_name)?;
     let prefix = format!("p2-{parent}-");
     let valid = parent != 0
-    && file.len() == prefix.len() + 32
-    && file.starts_with(&prefix)
-    && file[prefix.len()..].bytes().all(|b| b.is_ascii_hexdigit());
+        && file.len() == prefix.len() + 32
+        && file.starts_with(&prefix)
+        && file[prefix.len()..].bytes().all(|b| b.is_ascii_hexdigit());
     if valid {
         Ok(())
     } else {
@@ -79,17 +79,23 @@ fn user_sid() -> io::Result<String> {
         }
         let token = OwnedHandle::from_raw_handle(token);
         let mut length = 0;
-        GetTokenInformation(token.as_raw_handle(), TokenUser, ptr::null_mut(), 0, &mut length);
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenUser,
+            ptr::null_mut(),
+            0,
+            &mut length,
+        );
         if length == 0 {
             return Err(io::Error::other("token_query_failed"));
         }
         let mut buffer = vec![0u8; length as usize];
         if GetTokenInformation(
             token.as_raw_handle(),
-                               TokenUser,
-                               buffer.as_mut_ptr().cast(),
-                               length,
-                               &mut length,
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            length,
+            &mut length,
         ) == 0
         {
             return Err(io::Error::last_os_error());
@@ -120,16 +126,16 @@ impl PipeSecurity {
     fn new() -> io::Result<Self> {
         let sid = user_sid()?;
         let sddl: Vec<u16> = format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{sid})")
-        .encode_utf16()
-        .chain([0])
-        .collect();
+            .encode_utf16()
+            .chain([0])
+            .collect();
         let mut descriptor = ptr::null_mut();
         if unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 sddl.as_ptr(),
-                                                                 SDDL_REVISION_1,
-                                                                 &mut descriptor,
-                                                                 ptr::null_mut(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                ptr::null_mut(),
             )
         } == 0
         {
@@ -138,8 +144,8 @@ impl PipeSecurity {
         Ok(Self {
             attributes: SECURITY_ATTRIBUTES {
                 nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-           lpSecurityDescriptor: descriptor,
-           bInheritHandle: 0,
+                lpSecurityDescriptor: descriptor,
+                bInheritHandle: 0,
             },
             descriptor,
         })
@@ -167,10 +173,10 @@ pub fn server(name: &str) -> io::Result<NamedPipeServer> {
     // never outlives the descriptor the pipe actually uses.
     let pipe = unsafe {
         ServerOptions::new()
-        .first_pipe_instance(true)
-        // Default, stated for clarity: remote clients are refused.
-        .reject_remote_clients(true)
-        .create_with_security_attributes_raw(name, security.raw())
+            .first_pipe_instance(true)
+            // Default, stated for clarity: remote clients are refused.
+            .reject_remote_clients(true)
+            .create_with_security_attributes_raw(name, security.raw())
     }?;
     Ok(pipe)
 }

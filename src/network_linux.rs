@@ -52,10 +52,10 @@ impl Record {
             || self.local == self.peer
             || self.iface.is_empty()
             || self.iface.contains('/')
-            {
-                return Err(io::Error::other("native_record_invalid"));
-            }
-            Ok(())
+        {
+            return Err(io::Error::other("native_record_invalid"));
+        }
+        Ok(())
     }
 }
 
@@ -84,7 +84,9 @@ fn ip(args: &[&str]) -> io::Result<()> {
 }
 
 fn has_address(iface: &str, addr: Ipv4Addr) -> io::Result<bool> {
-    let out = Command::new("ip").args(["-o", "addr", "show", "dev", iface]).output()?;
+    let out = Command::new("ip")
+        .args(["-o", "addr", "show", "dev", iface])
+        .output()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let needle = format!("{addr}/32");
     Ok(text.split_whitespace().any(|f| f == needle))
@@ -100,8 +102,16 @@ fn address_present_anywhere(addr: Ipv4Addr) -> io::Result<bool> {
 fn add_address(iface: &str, addr: Ipv4Addr) -> io::Result<()> {
     let lifetime = LIFETIME.to_string();
     ip(&[
-        "addr", "add", &format!("{addr}/32"), "dev", iface,
-       "valid_lft", &lifetime, "preferred_lft", &lifetime, "nodad",
+        "addr",
+        "add",
+        &format!("{addr}/32"),
+        "dev",
+        iface,
+        "valid_lft",
+        &lifetime,
+        "preferred_lft",
+        &lifetime,
+        "nodad",
     ])
 }
 
@@ -117,7 +127,7 @@ fn forwarding(iface: &str) -> io::Result<bool> {
 fn set_forwarding(iface: &str, on: bool) -> io::Result<()> {
     fs::write(
         format!("/proc/sys/net/ipv4/conf/{iface}/forwarding"),
-            if on { "1" } else { "0" },
+        if on { "1" } else { "0" },
     )?;
     if on {
         fs::write("/proc/sys/net/ipv4/ip_forward", "1")?;
@@ -142,13 +152,15 @@ impl NativeHost {
     /// is information the caller must surface (second live instance, or an
     /// I/O error). The caller maps this to the `store_unavailable` event.
     pub fn new(store: JournalStore) -> io::Result<Self> {
-        let guard = store.lock().map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                           format!("journal lock unavailable: {e}"),
-            )
-        })?;
-        Ok(Self { store, guard, renewed: None, failed: false })
+        let guard = store
+            .lock()
+            .map_err(|e| io::Error::new(e.kind(), format!("journal lock unavailable: {e}")))?;
+        Ok(Self {
+            store,
+            guard,
+            renewed: None,
+            failed: false,
+        })
     }
 
     fn read(&self) -> io::Result<Option<Record>> {
@@ -193,10 +205,10 @@ impl NativeHost {
         // place; a crash between truncate and flush produced the zero-byte
         // file the read() guard above now recovers from.
         let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&next)?;
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&next)?;
         file.write_all(&serde_json::to_vec(r)?)?;
         file.sync_all()?;
         drop(file);
@@ -274,7 +286,10 @@ impl NativeHost {
         }
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if LEGACY_CM.iter().all(|a| has_address(&r.iface, *a).unwrap_or(false)) {
+            if LEGACY_CM
+                .iter()
+                .all(|a| has_address(&r.iface, *a).unwrap_or(false))
+            {
                 break;
             }
             if Instant::now() >= deadline {
@@ -296,16 +311,23 @@ impl NativeHost {
 
     fn renew(&mut self) -> io::Result<()> {
         let r = self
-        .read()?
-        .ok_or_else(|| io::Error::other("native_record_missing"))?;
+            .read()?
+            .ok_or_else(|| io::Error::other("native_record_missing"))?;
         let lifetime = LIFETIME.to_string();
         for addr in LEGACY_CM {
             if !has_address(&r.iface, addr)? {
                 return Err(io::Error::other("address_missing"));
             }
             ip(&[
-                "addr", "change", &format!("{addr}/32"), "dev", &r.iface,
-               "valid_lft", &lifetime, "preferred_lft", &lifetime,
+                "addr",
+                "change",
+                &format!("{addr}/32"),
+                "dev",
+                &r.iface,
+                "valid_lft",
+                &lifetime,
+                "preferred_lft",
+                &lifetime,
             ])?;
         }
         Ok(())
