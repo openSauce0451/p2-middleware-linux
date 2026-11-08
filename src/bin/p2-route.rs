@@ -57,10 +57,10 @@ fn run(name: &str, parent: u32) -> io::Result<bool> {
 async fn serve(stream: &mut Channel) -> Result<(), &'static str> {
     let mut lines = Lines::default();
     let line = tokio::time::timeout(Duration::from_secs(30), lines.next(stream))
-    .await
-    .map_err(|_| "request_timeout")?
-    .map_err(|_| "invalid_request")?
-    .ok_or("request_cancelled")?;
+        .await
+        .map_err(|_| "request_timeout")?
+        .map_err(|_| "invalid_request")?
+        .ok_or("request_cancelled")?;
 
     let command: Command = serde_json::from_slice(&line).map_err(|_| "invalid_request")?;
     if !matches!(command, Command::Session) {
