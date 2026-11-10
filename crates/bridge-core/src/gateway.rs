@@ -240,6 +240,24 @@ fn relay_connected(
                             json!({"direction":"client","summary":summary}),
                         );
                     }
+                    // --- client_message hex tap (CLIENT direction) -------------------
+                    if id == 5434 {
+                        event("5434_hex_rev", json!({
+                            "direction": "client",
+                            "emsg": id,
+                            "bytes": message.len(),
+                                                             "payload_hex": crate::stun::hex(&message),
+                        }));
+                    }
+                    // --- member-data hex tap (CLIENT direction) -------------------
+                    if id == 6613 {
+                        event("lobby_member_data_hex", json!({
+                            "direction": "client",
+                            "emsg": id,
+                            "bytes": message.len(),
+                                                             "payload_hex": crate::stun::hex(&message),
+                        }));
+                    }
                     message.zeroize();
                     channel::send_frame(&mut to_steam, &up.encode(&translated), deadline)?;
                     let mut state = state.lock().unwrap();
@@ -276,6 +294,24 @@ fn relay_connected(
                         "lobby_publication_diagnostic",
                         json!({"direction":"server","summary":summary}),
                     );
+                }
+                // --- server_message hex tap (SERVER direction) -------------------
+                if id == 5434 {
+                    event("5434_hex_rev", json!({
+                        "direction": "server",
+                        "emsg": id,
+                        "bytes": message.len(),
+                                                "payload_hex": crate::stun::hex(&message),
+                    }));
+                }
+                // --- member-data hex tap (SERVER direction) -------------------
+                if id == 6612 || id == 6613 || id == 6614 {
+                    event("lobby_member_data_hex", json!({
+                        "direction": "server",
+                        "emsg": id,
+                        "bytes": message.len(),
+                                                         "payload_hex": crate::stun::hex(&message),
+                    }));
                 }
                 if id == 751 {
                     let (_, header, body) = p::proto(&message)?;

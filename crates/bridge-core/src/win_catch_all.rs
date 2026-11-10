@@ -99,7 +99,7 @@ fn wsa_err(err: i32) -> io::Error {
 /// Winsock is reference-counted; WSAStartup is safe to call again even if the
 /// app already initialized it. Defensive: raw sockets fail with 10093
 /// (WSANOTINITIALISED) if nobody ever started it.
-fn ensure_wsa() -> io::Result<()> {
+pub(crate) fn ensure_wsa() -> io::Result<()> {
     unsafe {
         let mut data: WsaData = std::mem::zeroed();
         let rc = WSAStartup(0x0202, &mut data); // MAKEWORD(2,2)

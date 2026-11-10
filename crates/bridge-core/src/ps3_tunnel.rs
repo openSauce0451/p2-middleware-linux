@@ -78,7 +78,10 @@
 // =============================================================================
 
 use crate::{bad, channel::Envelope, gateway::event};
-use crate::stun::{send_allocate_response, send_stun_response_advertised, stun_classify, StunKind};
+use crate::stun::{
+    build_allocate_success, send_stun_response_advertised, stun_classify, StunKind,
+};
+use crate::udp_relay::bind_udp_reuse;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -609,7 +612,7 @@ impl Ps3Tunnel {
                         if skipped.contains(&p) || table.get(p).is_some() {
                             continue;
                         }
-                        match UdpSocket::bind(alias_addr(remote_ps3, p)) {
+                        match bind_udp_reuse(SocketAddrV4::new(remote_ps3, p)) {
                             Ok(s) => {
                                 let s = Arc::new(s);
                                 table.insert(p, s.clone());
@@ -686,6 +689,7 @@ impl Ps3Tunnel {
             let primary = config.remote_port;
             thread::spawn(move || {
                 let mut buf = [0u8; 2048];
+                let mut seen_lens: std::collections::HashSet<usize> = std::collections::HashSet::new();
                 loop {
                     let (n, from) = match wire.recv_from(&mut buf) {
                         Ok(v) => v,
@@ -822,6 +826,13 @@ impl Ps3Tunnel {
                                 "kind": format!("{:?}", e.kind())
                             }));
                         }
+                    }
+                    if seen_lens.insert(plain.len()) {
+                        event("tunnel_in_first", json!({
+                            "port": port,
+                            "len": plain.len() - 3,
+                                                       "payload_hex": crate::stun::hex(&plain[3..]),
+                        }));
                     }
                     event("tunnel_in", json!({ "port": port, "len": plain.len() }));
                 }
@@ -988,12 +999,11 @@ impl Ps3Tunnel {
                 let envelope_acq = envelope_base.clone();
                 let announced_endpoint = announce_slot.clone();
                 thread::spawn(move || {
-                    let target = alias_addr(remote_ps3, probe_port);
                     let socket = loop {
                         if stop.load(Ordering::Relaxed) {
                             return;
                         }
-                        match UdpSocket::bind(target) {
+                        match bind_udp_reuse(SocketAddrV4::new(remote_ps3, probe_port)) {
                             Ok(s) => break s,
                               Err(e) if e.kind() == io::ErrorKind::AddrNotAvailable => {
                                   if Instant::now() >= deadline {
@@ -1001,7 +1011,24 @@ impl Ps3Tunnel {
                                   }
                                   thread::sleep(POLL);
                               }
-                              Err(_) => return,
+                              // Should be unreachable now that SO_REUSEADDR is
+                              // set (both our wildcard and this socket allow
+                              // sharing). Fires only if an EXTERNAL process
+                              // without SO_REUSEADDR owns the tuple.
+                              Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+                                  event("tunnel_probe_port_busy", json!({
+                                      "probe_port": probe_port,
+                                      "error": e.to_string(),
+                                  }));
+                                  return;
+                              }
+                              Err(e) => {
+                                  event("tunnel_probe_bind_failed", json!({
+                                      "probe_port": probe_port,
+                                      "error": e.to_string(),
+                                  }));
+                                  return;
+                              }
                         }
                     };
 
@@ -1050,32 +1077,35 @@ impl Ps3Tunnel {
                               }
                                         };
                                         let relayed = SocketAddrV4::new(remote_ps3, port);
-                                        match send_allocate_response(
-                                            &socket, from, &buf[..n], relayed,
-                                        ) {
-                                            Ok(()) => {
-                                                event("tunnel_relay_allocated", json!({
+                                        let requester = match from { SocketAddr::V4(v4) => v4, SocketAddr::V6(_) => continue };
+                                        match build_allocate_success(&buf[..n], requester, relayed) {
+                                            Some(resp) => match socket.send_to(&resp, from) {
+                                                Ok(_) => event("tunnel_relay_allocated", json!({
                                                     "from": from.to_string(),
-                                                                                      "probe_port": probe_port,
-                                                                                      "relayed": relayed.to_string(),
-                                                                                      "dynamic": true,
-                                                }));
-                                            }
-                                            Err(e) if !transient(&e) => {
-                                                event("tunnel_relay_error", json!({
-                                                    "kind": format!("{:?}", e.kind()),
-                                                                                  "probe_port": probe_port,
-                                                                                  "dynamic": true,
-                                                }));
-                                            }
-                                            Err(_) => {}
+                                                                                               "probe_port": probe_port,
+                                                                                               "relayed": relayed.to_string(),
+                                                                                               "dynamic": true,
+                                                })),
+                              Err(e) if !transient(&e) => event("tunnel_relay_error", json!({
+                                  "kind": format!("{:?}", e.kind()),
+                                                                                            "probe_port": probe_port,
+                                                                                            "dynamic": true,
+                              })),
+                              Err(_) => {}
+                                            },
+                              None => event("tunnel_relay_error", json!({
+                                  "kind": "request_shorter_than_header",
+                                  "probe_port": probe_port,
+                                  "dynamic": true,
+                              })),
                                         }
                                     }
                                     StunKind::Other(msg_type) => {
                                         event("tunnel_stun_other", json!({
                                             "probe_port": probe_port,
+                                            "len": n,
                                             "type": format!("{:#06x}", msg_type),
-                                                                         "len": n,
+                                                                         "payload_hex": crate::stun::hex(&buf[..n]),
                                         }));
                                     }
                                     StunKind::NotStun => {}
@@ -1190,26 +1220,32 @@ pub(crate) fn spawn_console_worker(
                             // fresh allocation, no budget cost.
                             StunKind::Other(0x0003) if shared.relay_allocations => {
                                 let relayed = SocketAddrV4::new(shared.remote_ps3, port);
-                                match send_allocate_response(
-                                    &socket, from, &buf[..n], relayed,
-                                ) {
-                                    Ok(()) => event("tunnel_relay_allocated", json!({
-                                        "from": from.to_string(),
-                                                                                    "alias_port": port,
-                                                                                    "relayed": relayed.to_string(),
+                                let requester = match from { SocketAddr::V4(v4) => v4, SocketAddr::V6(_) => continue };
+                                match build_allocate_success(&buf[..n], requester , relayed) {
+                                    Some(resp) => match socket.send_to(&resp, from) {
+                                        Ok(_) => event("tunnel_relay_allocated", json!({
+                                            "from": from.to_string(),
+                                                                                       "alias_port": port,
+                                                                                       "relayed": relayed.to_string(),
+                                        })),
+                                        Err(e) if !transient(&e) => event("tunnel_relay_error", json!({
+                                            "kind": format!("{:?}", e.kind()),
+                                                                                                      "alias_port": port,
+                                        })),
+                                        Err(_) => {}
+                                    },
+                                    None => event("tunnel_relay_error", json!({
+                                        "kind": "request_shorter_than_header",
+                                        "alias_port": port,
                                     })),
-                                    Err(e) if !transient(&e) => event("tunnel_relay_error", json!({
-                                        "kind": format!("{:?}", e.kind()),
-                                                                                                  "alias_port": port,
-                                    })),
-                                    Err(_) => {}
                                 }
                             }
                             StunKind::Other(msg_type) => {
                                 event("tunnel_stun_other", json!({
-                                    "alias_port": port,
+                                    "port": port,
                                     "type": format!("{:#06x}", msg_type),
                                                                  "len": n,
+                                                                 "payload_hex": crate::stun::hex(&buf[..n]),
                                 }));
                             }
                             StunKind::NotStun => {}
@@ -1258,7 +1294,7 @@ fn acquire_relay_port(
     for _ in 0..2000 {
         if shared.table.get(port).is_some() { port = port.wrapping_add(1); continue; }
         shared.dyn_opened.fetch_add(1, Ordering::Relaxed);
-        match UdpSocket::bind(alias_addr(shared.remote_ps3, port)) {
+        match bind_udp_reuse(SocketAddrV4::new(shared.remote_ps3, port)) {
             Ok(s) => {
                 let s = Arc::new(s);
                 shared.table.insert(port, s.clone());
@@ -1332,7 +1368,7 @@ fn handle_dynamic(
                 }));
                 return;
             }
-            match UdpSocket::bind(alias_addr(remote_ps3, port)) {
+            match bind_udp_reuse(SocketAddrV4::new(remote_ps3, port)) {
                 Ok(s) => {
                     let s = Arc::new(s);
                     table.insert(port, s.clone());
@@ -1397,20 +1433,25 @@ fn handle_dynamic(
                 // The console Allocated on this exact tuple; this socket
                 // IS the relay — hand the tuple back, no fresh allocation.
                 let relayed = SocketAddrV4::new(shared.remote_ps3, port);
-                match send_allocate_response(
-                    &sock, SocketAddr::V4(src), data, relayed,
-                ) {
-                    Ok(()) => event("tunnel_relay_allocated", json!({
-                        "from": SocketAddr::V4(src).to_string(),
-                                                                    "alias_port": port,
-                                                                    "relayed": relayed.to_string(),
-                                                                    "dynamic": true,
+                match build_allocate_success(data, src, relayed) {
+                    Some(resp) => match sock.send_to(&resp, SocketAddr::V4(src)) {
+                        Ok(_) => event("tunnel_relay_allocated", json!({
+                            "from": SocketAddr::V4(src).to_string(),
+                                                                       "alias_port": port,
+                                                                       "relayed": relayed.to_string(),
+                                                                       "dynamic": true,
+                        })),
+                        Err(e) if !transient(&e) => event("tunnel_relay_error", json!({
+                            "kind": format!("{:?}", e.kind()),
+                                                                                      "alias_port": port,
+                        })),
+                        Err(_) => {}
+                    },
+                    None => event("tunnel_relay_error", json!({
+                        "kind": "request_shorter_than_header",
+                        "alias_port": port,
+                        "dynamic": true,
                     })),
-                    Err(e) if !transient(&e) => event("tunnel_relay_error", json!({
-                        "kind": format!("{:?}", e.kind()),
-                                                                                  "alias_port": port,
-                    })),
-                    Err(_) => {}
                 }
             }
             StunKind::Other(msg_type) => {
@@ -1418,6 +1459,7 @@ fn handle_dynamic(
                     "type": format!("{:#06x}", msg_type),
                                                  "len": data.len(),
                                                  "alias_port": port,
+                                                 "payload_hex": crate::stun::hex(data),
                 }));
             }
             StunKind::NotStun => {}

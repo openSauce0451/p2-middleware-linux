@@ -1,6 +1,13 @@
 //! Opt-in room advertisement translation, never inbound data or member metadata.
 //! Schema: Protobufs 6c35e1ad6b5401e4f95cd0923e8145a23613516c (MMS).
 //! Legacy framing: SteamKit 2049844fdf746420c9f31a9575d4b75c40a5d575 KeyValue.cs.
+//!
+//! Steam's MMS server mirrors lobby metadata in BOTH the legacy binary-KV blob
+//! (field 8) and protobuf pair records (field 12) inside a single server->client
+//! CMsgClientMMLobbyData (emsg 6612) broadcast. `metadata()` reconciles the two
+//! encodings when they agree; genuine conflicts remain hard errors. Byte-level
+//! rewriting stays strict: a dual-format message is never rewritten, because
+//! patching one encoding would desynchronize the surviving mirror.
 use crate::{bad, protocol as p};
 use serde_json::{json, Value};
 use std::{borrow::Cow, io, ops::Range};
@@ -55,12 +62,12 @@ fn number(f: &[p::Field<'_>], n: u32) -> io::Result<Option<u64>> {
 }
 fn fixed(f: &[p::Field<'_>], n: u32) -> io::Result<Option<u64>> {
     single(f, n, 1)?
-        .map(|v| {
-            v.try_into()
-                .map(u64::from_le_bytes)
-                .map_err(|_| bad("advertisement_fixed"))
-        })
-        .transpose()
+    .map(|v| {
+        v.try_into()
+        .map(u64::from_le_bytes)
+        .map_err(|_| bad("advertisement_fixed"))
+    })
+    .transpose()
 }
 
 struct Entry<'a> {
@@ -73,15 +80,26 @@ struct Metadata<'a> {
     source: &'static str,
     entries: Vec<Entry<'a>>,
     legacy: Option<&'a [u8]>,
+    /// Number of protobuf pair fields mirroring the legacy KV blob
+    /// (server->client lobby broadcasts carry both formats). None when the
+    /// message is not dual-format.
+    mirrored_pairs: Option<usize>,
+}
+/// One validated protobuf pair record (field 1 key, optional field 2 value),
+/// remembering its position among the message's protobuf fields.
+struct Pair<'a> {
+    key: &'a [u8],
+    value: Option<&'a [u8]>,
+    index: usize,
 }
 fn cstring<'a>(data: &'a [u8], at: &mut usize) -> io::Result<&'a [u8]> {
     let start = *at;
     let size = data
-        .get(start..)
-        .ok_or_else(|| bad("kv_truncated"))?
-        .iter()
-        .position(|b| *b == 0)
-        .ok_or_else(|| bad("kv_string"))?;
+    .get(start..)
+    .ok_or_else(|| bad("kv_truncated"))?
+    .iter()
+    .position(|b| *b == 0)
+    .ok_or_else(|| bad("kv_string"))?;
     if size > 4096 {
         return Err(bad("kv_string_limit"));
     }
@@ -139,19 +157,64 @@ fn kv_children<'a>(
         }
     }
 }
+// Shared pair-record validation for the protobuf_pairs source and for the
+// mirror reconciliation path, so both branches enforce identical limits.
+fn pair_records<'a>(pairs: &[(usize, &p::Field<'a>)]) -> io::Result<Vec<Pair<'a>>> {
+    if pairs.len() > ENTRIES {
+        return Err(bad("metadata_entries"));
+    }
+    let mut records = Vec::with_capacity(pairs.len());
+    for &(index, pair) in pairs {
+        if pair.wire != 2 {
+            return Err(bad("metadata_pair_wire"));
+        }
+        let pf = fields(pair.value)?;
+        let key = single(&pf, 1, 2)?.ok_or_else(|| bad("metadata_pair_name"))?;
+        let value = single(&pf, 2, 2)?;
+        if key.len() > 4096 || value.is_some_and(|v| v.len() > 4096) {
+            return Err(bad("metadata_string_limit"));
+        }
+        std::str::from_utf8(key).map_err(|_| bad("metadata_utf8"))?;
+        if let Some(v) = value {
+            std::str::from_utf8(v).map_err(|_| bad("metadata_utf8"))?;
+        }
+        records.push(Pair { key, value, index });
+    }
+    Ok(records)
+}
+// Dual-format reconciliation: every pair record must correspond to a legacy
+// KV entry with a matching key (ASCII case-insensitively, like the duplicate
+// check) and an identical value. Keys are unique at this point (the duplicate
+// check below would fail a message otherwise), so a linear find is sufficient.
+// An omitted pair value denotes an empty string; non-string KV kinds have no
+// value and match only an omitted pair value.
+fn reconcile_mirror(entries: &[Entry<'_>], records: &[Pair<'_>]) -> io::Result<()> {
+    if entries.len() != records.len() {
+        return Err(bad("metadata_dual_format"));
+    }
+    for record in records {
+        let Some(entry) = entries.iter().find(|e| e.key.eq_ignore_ascii_case(record.key)) else {
+            return Err(bad("metadata_dual_format"));
+        };
+        match (entry.value, record.value) {
+            (Some(v), Some(r)) if v == r => {}
+            (Some(v), None) if v.is_empty() => {}
+            (None, None) => {}
+            _ => return Err(bad("metadata_dual_format")),
+        }
+    }
+    Ok(())
+}
 fn metadata<'a>(f: &[p::Field<'a>], legacy_n: u32, pairs_n: u32) -> io::Result<Metadata<'a>> {
     let legacy = single(f, legacy_n, 2)?.filter(|b| !b.is_empty());
     let pairs: Vec<_> = f
-        .iter()
-        .enumerate()
-        .filter(|(_, x)| x.number == pairs_n)
-        .collect();
-    // Avoid relying on different clients' precedence for conflicting formats.
-    if legacy.is_some() && !pairs.is_empty() {
-        return Err(bad("metadata_dual_format"));
-    }
+    .iter()
+    .enumerate()
+    .filter(|(_, x)| x.number == pairs_n)
+    .collect();
     let mut entries = Vec::new();
     let source;
+    let mirrored_pairs;
     if let Some(data) = legacy {
         source = "legacy_binary_kv";
         if data.first() != Some(&0) {
@@ -164,47 +227,46 @@ fn metadata<'a>(f: &[p::Field<'a>], legacy_n: u32, pairs_n: u32) -> io::Result<M
         if !matches!(data.get(at), Some(8 | 11)) || at + 1 != data.len() {
             return Err(bad("kv_terminator"));
         }
+        if pairs.is_empty() {
+            mirrored_pairs = None;
+        } else {
+            // Steam's MMS mirrors the same metadata in both encodings inside a
+            // single server->client lobby broadcast. Decode against the KV
+            // blob; the mirror is accepted only when it agrees exactly.
+            let records = pair_records(&pairs)?;
+            reconcile_mirror(&entries, &records)?;
+            mirrored_pairs = Some(records.len());
+        }
     } else if !pairs.is_empty() {
         source = "protobuf_pairs";
-        if pairs.len() > ENTRIES {
-            return Err(bad("metadata_entries"));
-        }
-        for (index, pair) in pairs {
-            if pair.wire != 2 {
-                return Err(bad("metadata_pair_wire"));
-            }
-            let pf = fields(pair.value)?;
-            let key = single(&pf, 1, 2)?.ok_or_else(|| bad("metadata_pair_name"))?;
-            let value = single(&pf, 2, 2)?;
-            if key.len() > 4096 || value.is_some_and(|v| v.len() > 4096) {
-                return Err(bad("metadata_string_limit"));
-            }
-            std::str::from_utf8(key).map_err(|_| bad("metadata_utf8"))?;
-            if let Some(v) = value {
-                std::str::from_utf8(v).map_err(|_| bad("metadata_utf8"))?;
-            }
-            entries.push(Entry {
-                key,
-                value,
-                span: None,
-                pair_index: Some(index),
-            });
-        }
+        let records = pair_records(&pairs)?;
+        mirrored_pairs = None;
+        entries = records
+        .into_iter()
+        .map(|r| Entry {
+            key: r.key,
+            value: r.value,
+            span: None,
+            pair_index: Some(r.index),
+        })
+        .collect();
     } else {
         source = "absent";
+        mirrored_pairs = None;
     }
     for (i, entry) in entries.iter().enumerate() {
         if entries[..i]
             .iter()
             .any(|prior| prior.key.eq_ignore_ascii_case(entry.key))
-        {
-            return Err(bad("metadata_duplicate"));
-        }
+            {
+                return Err(bad("metadata_duplicate"));
+            }
     }
     Ok(Metadata {
         source,
-        entries,
-        legacy,
+       entries,
+       legacy,
+       mirrored_pairs,
     })
 }
 fn safe_metadata(meta: &Metadata<'_>) -> Value {
@@ -218,20 +280,21 @@ fn safe_metadata(meta: &Metadata<'_>) -> Value {
             b"system:lock" => {
                 safe.insert(
                     "system:lock".into(),
-                    json!(e
-                        .value
-                        .map(|v| if v.is_empty() { "empty" } else { "nonempty" })),
+                            json!(e
+                            .value
+                            .map(|v| if v.is_empty() { "empty" } else { "nonempty" })),
                 );
                 continue;
             }
             _ => continue,
         };
         let word = e
-            .value
-            .and_then(|v| words.iter().find(|w| v.eq_ignore_ascii_case(w.as_bytes())));
+        .value
+        .and_then(|v| words.iter().find(|w| v.eq_ignore_ascii_case(w.as_bytes())));
         safe.insert(std::str::from_utf8(e.key).unwrap().into(), json!(word));
     }
-    json!({"source":meta.source,"entry_count":meta.entries.len(),"allowed":safe})
+    json!({"source":meta.source,"entry_count":meta.entries.len(),"allowed":safe,
+        "mirrored_protobuf_pairs":meta.mirrored_pairs})
 }
 fn decode(message: &[u8]) -> io::Result<Value> {
     let (id, _, body) = p::proto(message)?;
@@ -263,11 +326,11 @@ fn decode(message: &[u8]) -> io::Result<Value> {
     let kind = number(&f, kind)?;
     Ok(
         json!({"emsg":id,"status":"decoded","app_id":620,"member_update":member,
-        "max_members":number(&f,capacity)?.filter(|v| *v <= 250),
-        "num_members":if id == 6612 { number(&f,3)?.filter(|v| *v <= 250) } else { None },
-        "lobby_type":kind.filter(|v| *v <= 4),
-        "lobby_type_name":kind.and_then(|v| ["private","friends","public","invisible","private_unique"].get(v as usize)),
-        "flags_raw":number(&f,flags)?.filter(|v| *v <= 65535),"metadata":meta}),
+            "max_members":number(&f,capacity)?.filter(|v| *v <= 250),
+              "num_members":if id == 6612 { number(&f,3)?.filter(|v| *v <= 250) } else { None },
+              "lobby_type":kind.filter(|v| *v <= 4),
+              "lobby_type_name":kind.and_then(|v| ["private","friends","public","invisible","private_unique"].get(v as usize)),
+              "flags_raw":number(&f,flags)?.filter(|v| *v <= 65535),"metadata":meta}),
     )
 }
 pub fn summarize(message: &[u8]) -> Option<Value> {
@@ -309,6 +372,11 @@ fn rewrite(message: &[u8]) -> io::Result<(Option<Vec<u8>>, &'static str, &'stati
     }
     let pairs = if id == 6601 { 11 } else { 9 };
     let meta = metadata(&f, 7, pairs)?;
+    // Patching one encoding of a dual-format message would leave the mirror
+    // contradicting it, so dual-format input is never rewritten.
+    if meta.mirrored_pairs.is_some() {
+        return Err(bad("metadata_dual_format"));
+    }
     let Some(entry) = meta.entries.iter().find(|e| e.key == b"game:platform") else {
         return Ok((None, "no_platform", meta.source));
     };
@@ -358,11 +426,108 @@ pub fn adapt(message: &[u8], policy: AdvertisePlatform) -> (Cow<'_, [u8]>, Optio
         return (Cow::Borrowed(message), None);
     }
     let (changed, reason, source) =
-        rewrite(message).unwrap_or((None, "malformed_ambiguous_or_limit", "unknown"));
+    rewrite(message).unwrap_or((None, "malformed_ambiguous_or_limit", "unknown"));
     let audit = json!({"emsg":id,"policy":"default","changed":changed.is_some(),"reason":reason,"source":source,
         "before":summarize(message),"after":changed.as_ref().and_then(|b| summarize(b))});
     (
         changed.map(Cow::Owned).unwrap_or(Cow::Borrowed(message)),
-        Some(audit),
+     Some(audit),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Rebuild a legacy binary-KV blob: root, empty root name, `01 key 00 value 00`
+    // string children, then the root and stream closers.
+    fn kv_blob(pairs: &[(&str, &str)]) -> Vec<u8> {
+        let mut out = vec![0u8, 0u8];
+        for (k, v) in pairs {
+            out.push(1);
+            out.extend_from_slice(k.as_bytes());
+            out.push(0);
+            out.extend_from_slice(v.as_bytes());
+            out.push(0);
+        }
+        out.extend_from_slice(&[8u8, 8]);
+        out
+    }
+    // Rebuild the mirrored protobuf pair records (message field 12).
+    fn pair_records_bytes(pairs: &[(&str, &str)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (k, v) in pairs {
+            let mut rec = Vec::new();
+            p::bin(1, k.as_bytes(), &mut rec);
+            p::bin(2, v.as_bytes(), &mut rec);
+            p::bin(12, &rec, &mut out);
+        }
+        out
+    }
+    fn lobby_6612(kv: &[u8], mirror: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        p::vi(1, 620, &mut body);
+        p::vi(3, 1, &mut body); // num_members
+        p::vi(4, 2, &mut body); // max_members
+        p::vi(5, 0, &mut body); // lobby_type: private
+        p::vi(6, 3, &mut body); // flags
+        p::bin(8, kv, &mut body);
+        body.extend_from_slice(mirror);
+        p::message(6612, &[], &body)
+    }
+    const META: &[(&str, &str)] = &[
+        ("members:numMachines", "1"),
+        ("members:numPlayers", "1"),
+        ("members:numSlots", "2"),
+        ("system:network", "LIVE"),
+        ("system:access", "private"),
+        ("game:mode", "coop"),
+        ("game:map", "default"),
+        ("game:mp_coop_start", "0"),
+        ("game:sixense_features", "1"),
+        ("game:state", "lobby"),
+        ("game:dlcrequired", "0"),
+        ("options:server", "official"),
+    ];
+
+    #[test]
+    fn dual_format_broadcast_decodes_when_mirror_agrees() {
+        let message = lobby_6612(&kv_blob(META), &pair_records_bytes(META));
+        let summary = summarize(&message).expect("6612 is summarized");
+        assert_eq!(summary["status"], "decoded");
+        assert_eq!(summary["num_members"], 1);
+        assert_eq!(summary["metadata"]["source"], "legacy_binary_kv");
+        assert_eq!(summary["metadata"]["entry_count"], 12);
+        assert_eq!(summary["metadata"]["mirrored_protobuf_pairs"], 12);
+    }
+
+    #[test]
+    fn dual_format_rejected_when_mirror_conflicts() {
+        let mut conflicted = Vec::from(META);
+        conflicted[1].1 = "3"; // differs from the KV blob
+        let message = lobby_6612(&kv_blob(META), &pair_records_bytes(&conflicted));
+        let summary = summarize(&message).expect("6612 is summarized");
+        assert_eq!(summary["status"], "unavailable");
+        assert_eq!(summary["reason"], "malformed_ambiguous_or_limit");
+    }
+
+    #[test]
+    fn kv_only_broadcast_still_decodes_without_mirror_field() {
+        let message = lobby_6612(&kv_blob(META), &[]);
+        let summary = summarize(&message).expect("6612 is summarized");
+        assert_eq!(summary["status"], "decoded");
+        assert!(summary["metadata"]["mirrored_protobuf_pairs"].is_null());
+    }
+
+    #[test]
+    fn mirror_with_extra_pair_is_rejected() {
+        let mut extra = Vec::from(pair_records_bytes(META));
+        let mut rec = Vec::new();
+        p::bin(1, b"rogue:key", &mut rec);
+        p::bin(2, b"rogue", &mut rec);
+        p::bin(12, &rec, &mut extra);
+        let message = lobby_6612(&kv_blob(META), &extra);
+        let summary = summarize(&message).expect("6612 is summarized");
+        assert_eq!(summary["status"], "unavailable");
+    }
 }

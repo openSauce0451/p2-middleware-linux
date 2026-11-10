@@ -5,13 +5,27 @@
 //! The `catch_all_port` config enables dynamic interception: instead of
 //! pre-binding a fixed port band, we let every candidate port the console
 //! picks get answered through the tunnel.
+//!
+//! REV 4 — Reply-source fix. The console dials a legacy CM ALIAS (e.g.
+//! 72.165.61.188:4380), but the wildcard STUN socket answered from the
+//! primary interface address (192.168.0.33:4380). STUN clients discard
+//! responses whose source != the address they dialed, so every reply —
+//! regardless of format — was silently dropped by the console. Since the
+//! route helper installs the LEGACY_CM addresses as LOCAL addresses on
+//! this machine, a socket specifically bound to alias:port receives the
+//! console's datagrams (most-specific match beats the wildcard) and
+//! replies with the correct alias source tuple. SO_REUSEADDR (set before
+//! bind, hence the raw-fd helper) lets the wildcard and the specific
+//! binds coexist, preserving the REV 3 wildcard-first race fix.
 
 use crate::bad;
 use crate::gateway::event;
 use crate::legacy_cm::LEGACY_CM;
-use crate::stun::{send_allocate_response, send_stun_response_advertised, stun_classify, StunKind};
+use crate::stun::{
+    build_allocate_success, hex, send_stun_response_advertised, stun_classify, StunKind,
+};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, ErrorKind};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -19,10 +33,156 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+use std::os::unix::io::FromRawFd;
+
 const MAX_DATAGRAM: usize = 65_535;
 const RECV_TIMEOUT: Duration = Duration::from_millis(250);
 const BIND_RETRY: Duration = Duration::from_secs(1);
 const FLOW_IDLE: Duration = Duration::from_secs(75);
+
+// ---------------------------------------------------------------------------
+// REV 4: raw-fd UDP bind with SO_REUSEADDR set BEFORE bind.
+//
+// std's UdpSocket exposes socket options only after binding, which is too
+// late: the wildcard must already carry SO_REUSEADDR when the per-alias
+// specific binds arrive (Linux requires the option on EVERY socket sharing
+// the port). Same raw-fd pattern as catch_all.rs.
+//
+// Semantics we rely on: with SO_REUSEADDR on both, 0.0.0.0:P and
+// alias:P coexist, and the kernel delivers each datagram to the MOST
+// SPECIFIC matching socket — so alias-bound sockets capture the console's
+// packets, and the wildcard remains a genuine fallback for anything not
+// covered by LEGACY_CM.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+pub(crate) fn bind_udp_reuse(addr: SocketAddrV4) -> io::Result<UdpSocket> {
+    unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_UDP);
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let one: libc::c_int = 1;
+        let ptr = &one as *const libc::c_int as *const libc::c_void;
+        let len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        if libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, ptr, len) < 0 {
+            let e = io::Error::last_os_error();
+            libc::close(fd);
+            return Err(e);
+        }
+        let mut sa: libc::sockaddr_in = std::mem::zeroed();
+        sa.sin_family = libc::AF_INET as libc::sa_family_t;
+        sa.sin_port = addr.port().to_be();
+        // sin_addr.s_addr is in network byte order; from_be_bytes(octets)
+        // yields an integer whose little-endian store reproduces the octets
+        // in order (same convention catch_all.rs uses in reverse).
+        sa.sin_addr.s_addr = u32::from_ne_bytes(addr.ip().octets());
+        let sa_ptr = &sa as *const libc::sockaddr_in as *const libc::sockaddr;
+        if libc::bind(
+            fd,
+            sa_ptr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        ) < 0
+        {
+            let e = io::Error::last_os_error();
+            libc::close(fd);
+            return Err(e);
+        }
+        Ok(UdpSocket::from_raw_fd(fd))
+    }
+}
+
+// ===========================================================================
+// Windows raw-bind helpers (winsock FFI, pattern shared with win_catch_all.rs)
+//
+// The wildcard STUN socket binds with SO_EXCLUSIVEADDRUSE so
+// it can never coexist with — and therefore never shadow — an alias-bound
+// socket on the same port. Consoles silently discard STUN replies whose
+// source differs from the dialed address, so wildcard/alias delivery
+// ambiguity on Windows is not cosmetic.
+// ===========================================================================
+
+#[cfg(target_os = "windows")]
+pub(crate) fn bind_udp_reuse(addr: SocketAddrV4) -> io::Result<UdpSocket> {
+    win_bind_udp(addr, 0x0004 /* SO_REUSEADDR */)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn bind_udp_exclusive(addr: SocketAddrV4) -> io::Result<UdpSocket> {
+    // winsock2.h: #define SO_EXCLUSIVEADDRUSE ((u_int)(~SO_REUSEADDR))
+    win_bind_udp(addr, 0xFFFF_FFFB_u32 as i32)
+}
+
+#[cfg(target_os = "windows")]
+fn win_bind_udp(addr: SocketAddrV4, sockopt: i32) -> io::Result<UdpSocket> {
+    use std::os::windows::io::FromRawSocket;
+
+    type SOCKET = usize;
+    const AF_INET: i32 = 2;
+    const SOCK_DGRAM: i32 = 2;
+    const IPPROTO_UDP: i32 = 17;
+    const SOL_SOCKET: i32 = 0xFFFF;
+    const INVALID_SOCKET: SOCKET = usize::MAX;
+    const SOCKET_ERROR: i32 = -1;
+
+    #[repr(C)]
+    struct SockaddrIn {
+        sin_family: u16,
+        sin_port: u16,
+        sin_addr: u32,
+        sin_zero: [u8; 8],
+    }
+
+    #[link(name = "ws2_32")]
+    extern "system" {
+        fn socket(af: i32, kind: i32, protocol: i32) -> SOCKET;
+        fn setsockopt(s: SOCKET, level: i32, optname: i32, optval: *const u8, optlen: i32) -> i32;
+        fn bind(s: SOCKET, addr: *const SockaddrIn, len: i32) -> i32;
+        fn closesocket(s: SOCKET) -> i32;
+    }
+
+    crate::win_catch_all::ensure_wsa()?;
+
+    unsafe {
+        let s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if s == INVALID_SOCKET {
+            return Err(io::Error::last_os_error());
+        }
+
+        let one: i32 = 1;
+        if setsockopt(
+            s,
+            SOL_SOCKET,
+            sockopt,
+            &one as *const i32 as *const u8,
+            std::mem::size_of::<i32>() as i32,
+        ) == SOCKET_ERROR
+        {
+            let e = io::Error::last_os_error();
+            closesocket(s);
+            return Err(e);
+        }
+
+        let mut sa: SockaddrIn = std::mem::zeroed();
+        sa.sin_family = AF_INET as u16;
+        sa.sin_port = addr.port().to_be();
+        sa.sin_addr = u32::from(*addr.ip()).to_be();
+
+        if bind(s, &sa, std::mem::size_of::<SockaddrIn>() as i32) == SOCKET_ERROR {
+            let e = io::Error::last_os_error();
+            closesocket(s);
+            return Err(e);
+        }
+
+        Ok(UdpSocket::from_raw_socket(s as u64))
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+pub(crate) fn bind_udp_reuse(addr: SocketAddrV4) -> io::Result<UdpSocket> {
+    UdpSocket::bind(SocketAddr::V4(addr))
+}
 
 /// Hooks connecting the legacy relay to the tunnel.
 /// All-off = legacy behavior (Allocates logged+dropped, raw tuple advertised).
@@ -128,7 +288,7 @@ impl UdpRelay {
                   "max_flows": shared.config.max_flows,
             }),
         );
-
+        let mut claimed: HashSet<(Ipv4Addr, u16)> = HashSet::new();
         // ---- RELAY family: config.ports on each legacy CM address ----
         for addr in LEGACY_CM {
             for port in shared.config.ports.clone() {
@@ -138,18 +298,70 @@ impl UdpRelay {
         }
 
         // ---- STUN family ----
-        for addr in LEGACY_CM {
-            for port in shared.config.stun_ports.clone() {
-                let shared = shared.clone();
-                thread::spawn(move || stun_listener_thread(shared, addr, port, false));
+        // Windows ordering guarantee: every alias STUN socket must own its port
+        // BEFORE any wildcard listener binds. The wildcard uses SO_EXCLUSIVEADDRUSE,
+        // which only succeeds when no alias socket holds the port, so coexistence
+        // — the source of reply-tuple ambiguity — is impossible by construction.
+        #[cfg(not(target_os = "windows"))]
+        {
+            for addr in LEGACY_CM {
+                for port in shared.config.stun_ports.clone() {
+                    let shared = shared.clone();
+                    thread::spawn(move || stun_listener_thread(shared, addr, port));
+                }
+            }
+            if shared.config.stun_wildcard {
+                for port in shared.config.stun_ports.clone() {
+                    let shared = shared.clone();
+                    thread::spawn(move || {
+                        stun_listener_thread(shared, Ipv4Addr::UNSPECIFIED, port)
+                    });
+                }
             }
         }
-        if shared.config.stun_wildcard {
+
+        #[cfg(target_os = "windows")]
+        {
+            // (a) Alias listeners: bound synchronously here, in this thread, so
+            //     by the time (b) exists, the ports are owned or known-failed.
             for port in shared.config.stun_ports.clone() {
+                for addr in LEGACY_CM {
+                    let bind_addr = SocketAddrV4::new(addr, port);
+                    let sock = match bind_udp_reuse(bind_addr) {
+                        Ok(s) => {
+                            let _ = s.set_read_timeout(Some(RECV_TIMEOUT));
+                            event("udp_stun_listening", json!({ "local": bind_addr.to_string() }));
+                            Some(s)
+                        }
+                        Err(_) => None, // retry thread below keeps the BIND_RETRY loop
+                    };
+                    let shared = shared.clone();
+                    thread::spawn(move || stun_alias_thread_windows(shared, bind_addr, sock));
+                }
+            }
+            // (b) Wildcard listeners: spawned strictly after every alias bind above
+            //     returned, so the exclusive bind can never pre-empt a slow binder.
+            if shared.config.stun_wildcard {
+                for port in shared.config.stun_ports.clone() {
+                    let shared = shared.clone();
+                    thread::spawn(move || stun_wildcard_thread_windows(shared, port));
+                }
+            }
+        }
+
+        // ---- legacy CM aliases: specific binds; now coexisting with the
+        // wildcard via SO_REUSEADDR (REV 4). Each replies from the alias
+        // the console actually dialed — the reply-source fix. ----
+        for addr in LEGACY_CM {
+            for port in shared.config.stun_ports.clone() {
+                if !claimed.insert((addr, port)) {
+                    event("udp_stun_duplicate_alias_skipped", json!({
+                        "local": format!("{}:{}", addr, port),
+                    }));
+                    continue;
+                }
                 let shared = shared.clone();
-                thread::spawn(move || {
-                    stun_listener_thread(shared, Ipv4Addr::UNSPECIFIED, port, true)
-                });
+                thread::spawn(move || stun_listener_thread(shared, addr, port));
             }
         }
 
@@ -220,23 +432,83 @@ fn serve_listener(shared: &Arc<Shared>, sock: &Arc<UdpSocket>, local: SocketAddr
     }
 }
 
-fn stun_listener_thread(shared: Arc<Shared>, addr: Ipv4Addr, port: u16, wildcard: bool) {
+// Un-gate: works on all platforms again.
+fn stun_listener_thread(shared: Arc<Shared>, addr: Ipv4Addr, port: u16) {
     let bind_addr = SocketAddrV4::new(addr, port);
     loop {
         if shared.stopping() { return; }
-        let sock = match UdpSocket::bind(SocketAddr::V4(bind_addr)) {
+        // Platform dispatch: SO_REUSEADDR before bind on both Windows
+        // (FFI helper) and Linux (raw-fd helper), plain std bind elsewhere.
+        let sock = match bind_udp_reuse(bind_addr) {
             Ok(s) => Arc::new(s),
-            Err(e) if wildcard && e.kind() == ErrorKind::AddrInUse => {
+            Err(e) if e.kind() == ErrorKind::AddrInUse => {
                 event("udp_stun_port_busy", json!({"local": bind_addr.to_string()}));
                 return;
             }
-            Err(_) => {
-                thread::sleep(BIND_RETRY);
-                continue;
-            }
+            Err(_) => { thread::sleep(BIND_RETRY); continue; }
         };
         let _ = sock.set_read_timeout(Some(RECV_TIMEOUT));
         event("udp_stun_listening", json!({"local": bind_addr.to_string()}));
+        if serve_stun(&shared, &sock) { return; }
+        thread::sleep(BIND_RETRY);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn stun_alias_thread_windows(
+    shared: Arc<Shared>,
+    bind_addr: SocketAddrV4,
+    first: Option<UdpSocket>,
+) {
+    let mut pre = first;
+    loop {
+        if shared.stopping() { return; }
+        let sock = match pre.take() {
+            Some(s) => Arc::new(s), // bound synchronously in spawn(): wins the port race
+            None => match bind_udp_reuse(bind_addr) {
+                Ok(s) => {
+                    let _ = s.set_read_timeout(Some(RECV_TIMEOUT));
+                    event("udp_stun_listening", json!({ "local": bind_addr.to_string() }));
+                    Arc::new(s)
+                }
+                Err(_) => { thread::sleep(BIND_RETRY); continue; }
+            },
+        };
+        if serve_stun(&shared, &sock) { return; }
+        thread::sleep(BIND_RETRY);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn stun_wildcard_thread_windows(shared: Arc<Shared>, port: u16) {
+    let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
+    let mut announced = false;
+    loop {
+        if shared.stopping() { return; }
+        let sock = match bind_udp_exclusive(bind_addr) {
+            Ok(s) => {
+                let _ = s.set_read_timeout(Some(RECV_TIMEOUT));
+                // Loud by design: this is only reachable when NO alias socket
+                // owns the port (alias addresses missing). Replies from here
+                // are wrongly sourced and consoles will drop them.
+                event("udp_stun_wildcard_active",
+                      json!({ "local": bind_addr.to_string(),
+                          "note": "alias sockets absent; replies wrongly sourced" }));
+                Arc::new(s)
+            }
+            Err(e) if e.kind() == ErrorKind::AddrInUse => {
+                // The healthy case: alias sockets own this port. Poll quietly
+                // (announce once) so we can take over only if they ever die.
+                if !announced {
+                    announced = true;
+                    event("udp_stun_wildcard_deferred",
+                          json!({ "local": bind_addr.to_string(), "reason": "alias_owned" }));
+                }
+                thread::sleep(BIND_RETRY);
+                continue;
+            }
+            Err(_) => { thread::sleep(BIND_RETRY); continue; }
+        };
         if serve_stun(&shared, &sock) { return; }
         thread::sleep(BIND_RETRY);
     }
@@ -251,7 +523,13 @@ fn serve_stun(shared: &Arc<Shared>, sock: &Arc<UdpSocket>) -> bool {
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => continue,
             Err(_) => return false,
         };
-        if source.ip() != std::net::IpAddr::V4(shared.config.peer) { continue; }
+        if source.ip() != std::net::IpAddr::V4(shared.config.peer)
+            && std::env::var("P2_ALLOW_ANY_SENDER").is_err()
+            {     event("tunnel_peer_filter_drop", json!({
+                "source": source.to_string(),
+                                                         "peer": shared.config.peer.to_string(),
+            }));
+        continue; }
         let (do_relay, allocate_relay, stun_advertise) = {
             let h = shared.hooks.lock().unwrap();
             (h.relay_allocations, h.allocate_relay.clone(), h.stun_advertise.clone())
@@ -293,13 +571,25 @@ fn serve_stun(shared: &Arc<Shared>, sock: &Arc<UdpSocket>) -> bool {
                     }
                 };
                 match relayed {
-                    Some(relayed) => match send_allocate_response(sock, source, &buf[..n], relayed) {
-                        Ok(()) => event("udp_relay_allocated", json!({
+                    Some(relayed) => match build_allocate_success(&buf[..n], requester, relayed) {
+                        Some(resp) => match sock.send_to(&resp, source) {
+                            Ok(sent) => event("udp_relay_allocated", json!({
+                                "console": source.to_string(),
+                                                                           "relayed": relayed.to_string(),
+                                                                           "local": sock.local_addr().map(|a| a.to_string()).unwrap_or_default(),
+                                                                           "req_hex": hex(&buf[..n]),
+                                                                           "resp_hex": hex(&resp),
+                                                                           "sent": sent,
+                            })),
+                            Err(e) => event("udp_relay_allocate_error", json!({
+                                "console": source.to_string(),
+                                                                              "error": e.to_string(),
+                            })),
+                        },
+                        None => event("udp_relay_allocate_error", json!({
                             "console": source.to_string(),
-                                                                     "relayed": relayed.to_string(),
-                                                                     "local": sock.local_addr().map(|a| a.to_string()).unwrap_or_default(),
+                                                                        "reason": "request_shorter_than_header",
                         })),
-                        Err(_) => event("udp_relay_allocate_error", json!({"console": source.to_string()})),
                     },
                     None => event("udp_relay_allocate_unavailable", json!({
                         "console": source.to_string(),
