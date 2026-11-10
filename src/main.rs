@@ -369,8 +369,8 @@ Check the PS3 address, or pass --iface explicitly."
             self.note("Existing settings are invalid; fix the file before continuing.");
             return false;
         }
-        if self.settings.save().is_err() {
-            self.note("Could not save the PS3 address.");
+        if let Err(e) = self.settings.save() {
+            self.note(format!("Could not save the PS3 address: {e}"));
             return false;
         }
 
@@ -440,6 +440,27 @@ check [tunnel] in settings.toml",
                     "[headless] tunnel alias created: {}/32 on {}",
                     t.remote_ps3, iface
                 );
+                // REV 3: the TPROXY divert makes unbound alias ports reach the
+                // catch-all instead of dying as ICMP port-unreachable. Must
+                // install AFTER the alias (divert to a non-local address
+                // blackholes peer traffic).
+                let catch_all = t.catch_all_port.unwrap_or(27051);
+                match tunnel_setup::ensure_tproxy_divert(remote, &iface, catch_all) {
+                    Ok(()) => println!(
+                        "[headless] tproxy divert active: udp to {remote} -> :{catch_all}"
+                    ),
+                    Err(e) => {
+                        // Non-fatal, but loud: without the divert, out-of-band
+                        // peer candidate ports get ICMP-refused (the kick).
+                        let manual = format!(
+                            "sudo iptables -t mangle -A PREROUTING -i {iface} -p udp -d {t} \
+-j TPROXY --on-port {catch_all} --tproxy-mark 0x1",
+t = t.remote_ps3,
+                        );
+                        eprintln!("[headless] tproxy divert failed: {e}. Manual: {manual}");
+                        self.note(format!("Tproxy divert unavailable. Manual: {manual}"));
+                    }
+                }
             }
         }
 
