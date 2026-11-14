@@ -97,6 +97,11 @@ pub struct LobbyPolicies {
     pub search_platform: SearchPlatform,
     pub search_distance: SearchDistance,
     pub advertise_platform: AdvertisePlatform,
+    /// (alias, catch_all_port) verified via divert_ready before 5434
+    /// offers release to the console. None = no gate.
+    /// PLATFORM LIMIT: always None on Windows — TPROXY is Linux-only.
+    #[cfg(target_os = "linux")]
+    pub tunnel_net: Option<(std::net::Ipv4Addr, u16)>,
 }
 
 pub fn relay(ps3: TcpStream, auth: &Authorization, deadline: Instant) -> io::Result<()> {
@@ -131,6 +136,8 @@ pub fn relay_with_search_policies(
             search_platform,
             search_distance,
             advertise_platform: AdvertisePlatform::Preserve,
+            #[cfg(target_os = "linux")]
+            tunnel_net: None,
         },
     )
 }
@@ -240,6 +247,24 @@ fn relay_connected(
                             json!({"direction":"client","summary":summary}),
                         );
                     }
+                    // --- client_message hex tap (CLIENT direction) -------------------
+                    if id == 5434 {
+                        event("5434_hex_rev", json!({
+                            "direction": "client",
+                            "emsg": id,
+                            "bytes": message.len(),
+                                                             "payload_hex": crate::stun::hex(&message),
+                        }));
+                    }
+                    // --- member-data hex tap (CLIENT direction) -------------------
+                    if id == 6613 {
+                        event("lobby_member_data_hex", json!({
+                            "direction": "client",
+                            "emsg": id,
+                            "bytes": message.len(),
+                                                             "payload_hex": crate::stun::hex(&message),
+                        }));
+                    }
                     message.zeroize();
                     channel::send_frame(&mut to_steam, &up.encode(&translated), deadline)?;
                     let mut state = state.lock().unwrap();
@@ -276,6 +301,44 @@ fn relay_connected(
                         "lobby_publication_diagnostic",
                         json!({"direction":"server","summary":summary}),
                     );
+                }
+                // --- server_message hex tap (SERVER direction) ---
+                if id == 5434 {
+                    event("5434_hex_rev", json!({
+                        "direction": "server",
+                        "emsg": id,
+                        "bytes": message.len(),
+                                                "payload_hex": crate::stun::hex(&message),
+                    }));
+
+                    // POINT B — divert gate on the OFFER RELEASE to our console.
+                    // This frame hands the console session tokens + candidate tuples;
+                    // the instant it lands, the console starts probing the alias. If
+                    // the divert isn't verifiably up, the probes die as ICMP (frame
+                    // 3262). Healthy path: Point A already passed, first poll succeeds,
+                    // cost ~microseconds. Pathological path: bounded hold, then abort —
+                    // the console's Steam session drops and retries once the operator
+                    // fixes the plumbing (fail-fast, never silent).
+                    #[cfg(target_os = "linux")]
+                    if let Some((alias, catch_all)) = policies.tunnel_net {
+                        if !crate::ps3_tunnel::await_divert(alias, catch_all, 3) {
+                            event("offer_release_blocked", json!({
+                                "alias": alias.to_string(),
+                                                                 "catch_all_port": catch_all,
+                                                                 "action": "relay_abort",
+                            }));
+                            return Err(bad("divert_not_ready_at_offer"));
+                        }
+                    }
+                }
+                // --- member-data hex tap (SERVER direction) -------------------
+                if id == 6612 || id == 6613 || id == 6614 {
+                    event("lobby_member_data_hex", json!({
+                        "direction": "server",
+                        "emsg": id,
+                        "bytes": message.len(),
+                                                         "payload_hex": crate::stun::hex(&message),
+                    }));
                 }
                 if id == 751 {
                     let (_, header, body) = p::proto(&message)?;
