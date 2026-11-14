@@ -14,6 +14,14 @@ This README has two parts:
 ---
 ---
 
+## ⚠️ KNOWN BUGS:
+
+- Local split-screen co-op progress gets reset when using the middleware online. **Make backups of your save files!** Workaround by playing in one continuous session
+- Possible game kick at chapter transitions
+- No Steam cloud save sync
+
+---
+
 # PART 1 — HOW TO RUN IT (Quick Start Guide)
 
 ## What you need
