@@ -135,7 +135,7 @@ In your user folder there's a file called **`settings.toml`**. Open it with Note
 
 Linux: `~/.config/p2-middleware/settings.toml`
 
-Windows: `/%LOCALAPPDATA%\P2middleware\settings.toml`
+Windows: `\%LOCALAPPDATA%\P2middleware\settings.toml`
 
 There's a worked example below, but the short version is: **your own numbers go on top, and the lines marked "partner" get the numbers your partner told you.**
 
