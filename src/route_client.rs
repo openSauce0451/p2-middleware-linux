@@ -94,6 +94,7 @@ impl RouteClient {
                         }
                         match tokio::time::timeout(Duration::from_millis(100),lines.next(&mut pipe)).await {
                             Ok(Ok(Some(line))) => {
+                                eprintln!("[route] {}", String::from_utf8_lossy(&line));
                                 if let Ok(text)=std::str::from_utf8(&line) {
                                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
                                         match value["event"].as_str() {

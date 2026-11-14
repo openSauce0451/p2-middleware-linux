@@ -1,6 +1,8 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 use eframe::egui::{self, Color32, RichText};
 use p2_bridge_core::gateway::Authorization;
+#[cfg(target_os = "linux")]
+use p2_middleware::tunnel_setup;
 use p2_middleware::{
     approval::{ApprovalEvent, PendingApproval},
     bridge::{launch_error_message, Bridge},
@@ -8,11 +10,14 @@ use p2_middleware::{
     network::{self, Adapter},
     RouteClient,
 };
+use std::io::Write;
 use qrcode::{render::unicode, QrCode};
 use std::{
     sync::mpsc::{self, Receiver},
     time::{Duration, Instant},
 };
+
+mod pairing_cli;
 
 const GREEN: Color32 = Color32::from_rgb(34, 160, 80);
 const RED: Color32 = Color32::from_rgb(210, 50, 50);
@@ -22,10 +27,7 @@ const GRAY: Color32 = Color32::from_rgb(150, 150, 150);
 /// Render a QR code as half-block Unicode art, sized for the terminal.
 fn qr_ascii(url: &str) -> Result<String, Box<dyn std::error::Error>> {
     let code = QrCode::new(url.as_bytes())?;
-    Ok(code
-    .render::<unicode::Dense1x2>()
-    .quiet_zone(true)
-    .build())
+    Ok(code.render::<unicode::Dense1x2>().quiet_zone(true).build())
 }
 
 fn status(ui: &mut egui::Ui, color: Color32, name: &str, value: &str) {
@@ -52,9 +54,9 @@ fn detect_lan_adapter(ps3_ip: &str) -> Option<(String, String, u8)> {
     let ps3: Ipv4Addr = ps3_ip.trim().parse().ok()?;
 
     let out = std::process::Command::new("ip")
-    .args(["-br", "addr", "show"])
-    .output()
-    .ok()?;
+        .args(["-br", "addr", "show"])
+        .output()
+        .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
 
     for line in text.lines() {
@@ -83,10 +85,10 @@ fn detect_lan_adapter(ps3_ip: &str) -> Option<(String, String, u8)> {
                 Err(_) => continue,
             };
             let prefix: u8 = field
-            .split('/')
-            .nth(1)
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(24);
+                .split('/')
+                .nth(1)
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(24);
 
             // Same subnet as the PS3? This is the test for_console() is
             // supposed to perform, and it naturally excludes the VPN
@@ -114,9 +116,9 @@ fn detect_lan_adapter(_ps3_ip: &str) -> Option<(String, String, u8)> {
 #[cfg(not(windows))]
 fn iface_index(name: &str) -> Option<u32> {
     let out = std::process::Command::new("ip")
-    .args(["-o", "link", "show", name])
-    .output()
-    .ok()?;
+        .args(["-o", "link", "show", name])
+        .output()
+        .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     // "2: enp39s0: <BROADCAST,MULTICAST,UP,LOWER_UP> ..."
     text.split(':').next()?.trim().parse::<u32>().ok()
@@ -132,9 +134,9 @@ fn iface_index(_name: &str) -> Option<u32> {
 #[cfg(not(windows))]
 fn default_router_for(iface: &str) -> Option<String> {
     let out = std::process::Command::new("ip")
-    .args(["route", "show", "default", "dev", iface])
-    .output()
-    .ok()?;
+        .args(["route", "show", "default", "dev", iface])
+        .output()
+        .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let tokens: Vec<&str> = text.split_whitespace().collect();
     let pos = tokens.iter().position(|t| *t == "via")?;
@@ -186,8 +188,15 @@ impl App {
         style.spacing.button_padding = egui::vec2(14.0, 8.0);
         cc.egui_ctx.set_style(style);
 
+        // Splice 1: Module import already added above (use p2_middleware::tunnel_setup;)
+
         let mut app = Self {
-            settings: Settings::load().unwrap_or_default(),
+            settings: Settings::load().unwrap_or_else(|e| {
+                eprintln!(
+                    "[settings] LOAD FAILED: {e:?} — falling back to defaults (tunnel disabled)"
+                );
+                Settings::default()
+            }),
             adapters: vec![],
             selected: None,
             discovery: None,
@@ -213,6 +222,17 @@ impl App {
 
         if let Some(ip) = ps3 {
             app.settings.ps3_ip = ip;
+        }
+
+        // Splice 2: Orphan recovery for crashed previous sessions (Linux-only)
+        #[cfg(target_os = "linux")]
+        {
+            use std::path::Path;
+            if Path::new(tunnel_setup::STATE).exists() {
+                eprintln!("[startup] recovering stale tunnel alias from previous session");
+                tunnel_setup::remove_steam_bypass();
+                tunnel_setup::remove_journalled();
+            }
         }
 
         app.discover();
@@ -263,9 +283,8 @@ impl App {
     fn discover(&mut self) {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(
-                network::adapters().map_err(|_| "Could not detect the home network.".into()),
-            );
+            let _ = tx
+                .send(network::adapters().map_err(|_| "Could not detect the home network.".into()));
         });
         self.discovery = Some(rx);
     }
@@ -283,6 +302,11 @@ impl App {
         if let Some(route) = &mut self.route {
             route.reset();
         }
+        // Splice 4a: Teardown tunnel alias on reset
+        #[cfg(target_os = "linux")]
+        tunnel_setup::remove_steam_bypass();
+        #[cfg(target_os = "linux")]
+        tunnel_setup::remove_journalled();
     }
 
     fn forget(&mut self) {
@@ -317,9 +341,9 @@ Check the PS3 address, or pass --iface explicitly."
         };
 
         let router = self
-        .router_override
-        .clone()
-        .or_else(|| default_router_for(&iface));
+            .router_override
+            .clone()
+            .or_else(|| default_router_for(&iface));
 
         let Some(router) = router else {
             eprintln!(
@@ -335,22 +359,119 @@ Check the PS3 address, or pass --iface explicitly."
 
         if let Err(e) = self.settings.validate() {
             eprintln!("[headless] settings rejected: {e}");
+            if self.settings.tunnel.is_none() {
+                eprintln!("[headless] WARNING: no [tunnel] section in settings.toml — gameplay tunnel DISABLED");
+                self.note("Add a [tunnel] section in settings.toml");
+                return false;
+            }
             self.note(e);
             return false;
         }
-        if self.settings.save().is_err() {
-            self.note("Could not save the PS3 address.");
+        if let Err(e) = Settings::load() {
+            eprintln!("[headless] refusing to save over unreadable settings: {e}");
+            self.note("Existing settings are invalid; fix the file before continuing.");
+            return false;
+        }
+        if let Err(e) = self.settings.save() {
+            self.note(format!("Could not save the PS3 address: {e}"));
             return false;
         }
 
         match iface_index(&iface) {
             Some(idx) => {
-                println!("[headless] interface {iface} (index {idx}), {pc_ip}/{prefix}, router {router}");
-                self.headless_iface = Some((iface, idx));
+                println!(
+                    "[headless] interface {iface} (index {idx}), {pc_ip}/{prefix}, router {router}"
+                );
+                self.headless_iface = Some((iface.clone(), idx));
             }
             None => {
                 eprintln!("[headless] could not read the kernel index for {iface}");
                 self.note("Could not resolve the interface index.");
+                return false;
+            }
+        }
+
+        // Steam CM bypass: Valve traffic exits via the ISP, not the VPN.
+        #[cfg(target_os = "linux")]
+        match tunnel_setup::ensure_steam_bypass(&router, &iface) {
+            Ok(true) => println!(
+                "[headless] Steam CM bypass active: {} via {} dev {}",
+                tunnel_setup::STEAM_CM_PREFIX,
+                router,
+                iface
+            ),
+            Ok(false) => {} // already present (idempotent)
+            Err(e) => {
+                // Same policy as the alias: non-fatal, name the manual fix.
+                let manual = format!(
+                    "sudo ip route add {} via {} dev {}",
+                    tunnel_setup::STEAM_CM_PREFIX,
+                    router,
+                    iface
+                );
+                eprintln!("[headless] Steam bypass route failed: {e}. Manual: {manual}");
+                self.note(format!("Steam bypass unavailable. Manual: {manual}"));
+            }
+        }
+
+        // Splice 3: Create tunnel alias if [tunnel] config exists
+        #[cfg(target_os = "linux")]
+        if let Some(ref t) = self.settings.tunnel {
+            let remote = match t.remote_ps3.parse::<std::net::Ipv4Addr>() {
+                Ok(ip) => ip,
+                Err(_) => {
+                    eprintln!(
+                        "[headless] invalid remote_ps3 in settings: '{}' — \
+check [tunnel] in settings.toml",
+t.remote_ps3
+                    );
+                    self.note(format!(
+                        "Tunnel config invalid: remote_ps3 '{}' is not an IPv4 address.",
+                        t.remote_ps3
+                    ));
+                    return false;
+                }
+            };
+
+            let alias_err = match tunnel_setup::ensure_alias(remote, &iface) {
+                Ok(()) => {
+                    println!(
+                        "[headless] tunnel alias created: {}/32 on {}",
+                        t.remote_ps3, iface
+                    );
+                    None
+                }
+                Err(e) => Some(e),
+            };
+
+            // REV 3: the TPROXY divert makes unbound alias ports reach the
+            // catch-all instead of dying as ICMP port-unreachable. Now
+            // attempted unconditionally: ensure_tproxy_divert itself
+            // refuses when the alias isn't assigned, which converts an
+            // alias failure from "silent degrade" into a loud abort.
+            let catch_all = t.catch_all_port.unwrap_or(27051);
+            match tunnel_setup::ensure_tproxy_divert(remote, &iface, catch_all) {
+                Ok(()) => println!(
+                    "[headless] tproxy divert active: udp to {remote} -> :{catch_all}"
+                ),
+                Err(e) => {
+                    let manual = format!(
+                        "sudo iptables -t mangle -A PREROUTING -p udp -d {alias} \
+-j TPROXY --on-port {catch_all} --tproxy-mark 0x1",
+alias = t.remote_ps3,
+                    );
+                    eprintln!(
+                        "[headless] tproxy divert failed: {e} (alias step: {:?}). Manual: {manual}",
+                              alias_err
+                    );
+                    self.note(format!("Tproxy divert unavailable ({e}). Manual: {manual}"));
+                    return false;
+                }
+            }
+
+            // POINT A GATE — single source: bridge-core's ps3_tunnel.
+            if !p2_bridge_core::ps3_tunnel::await_divert(remote, catch_all, 3) {
+                self.note("Divert gate failed: alias/divert not verifiably up. Aborting apply.");
                 return false;
             }
         }
@@ -371,12 +492,12 @@ Check the PS3 address, or pass --iface explicitly."
         }
 
         let chosen = network::for_console(&self.adapters, &self.settings.ps3_ip)
-        .ok()
-        .or_else(|| {
-            self.adapters
-            .iter()
-            .find(|a| Some(a.index) == self.selected)
-        });
+            .ok()
+            .or_else(|| {
+                self.adapters
+                    .iter()
+                    .find(|a| Some(a.index) == self.selected)
+            });
 
         let Some(adapter) = chosen else {
             if self.headless {
@@ -453,10 +574,10 @@ Check the PS3 address, or pass --iface explicitly."
         }
 
         let events: Vec<_> = self
-        .approval
-        .as_ref()
-        .map(|p| p.events.try_iter().collect())
-        .unwrap_or_default();
+            .approval
+            .as_ref()
+            .map(|p| p.events.try_iter().collect())
+            .unwrap_or_default();
         for event in events {
             match event {
                 ApprovalEvent::Challenge(url) if !self.cancelling && !self.closing => {
@@ -507,11 +628,12 @@ Check the PS3 address, or pass --iface explicitly."
         }
 
         let events: Vec<_> = self
-        .route
-        .as_ref()
-        .map(|r| r.events.try_iter().collect())
-        .unwrap_or_default();
+            .route
+            .as_ref()
+            .map(|r| r.events.try_iter().collect())
+            .unwrap_or_default();
         for message in events {
+            eprintln!("[route] {message}"); // add this line, unconditional
             if self.headless {
                 eprintln!("[headless] {message}");
             }
@@ -542,10 +664,10 @@ Check the PS3 address, or pass --iface explicitly."
         }
 
         let events: Vec<_> = self
-        .bridge
-        .as_ref()
-        .map(|b| b.events.try_iter().collect())
-        .unwrap_or_default();
+            .bridge
+            .as_ref()
+            .map(|b| b.events.try_iter().collect())
+            .unwrap_or_default();
         for message in events {
             if self.headless {
                 eprintln!("[headless] {message}");
@@ -557,62 +679,62 @@ Check the PS3 address, or pass --iface explicitly."
             .bridge
             .as_mut()
             .is_some_and(|b| !matches!(b.finished(), Ok(false)))
+        {
+            self.reset();
+            self.gateway_failed = true;
+            self.note("Bridge stopped. Network settings restored.");
+        }
+
+        if self.applying && self.route.as_ref().is_some_and(|r| r.clean()) {
+            self.stop_bridge();
+        }
+
+        if self.confirmed
+            && !self.closing
+            && self.authorization.is_some()
+            && self.bridge.is_none()
+            && self.route.as_ref().is_some_and(|r| r.clean())
+        {
+            match Bridge::start(&self.settings, self.authorization.as_ref().unwrap()) {
+                Ok(b) => {
+                    if self.headless {
+                        eprintln!("[headless] Bridge::start OK — waiting for ready()");
+                    }
+                    self.bridge = Some(b);
+                    self.note("Connecting the gateway...");
+                }
+                Err(e) => {
+                    eprintln!("[headless] Bridge::start FAILED: {e:?}");
+                    self.confirmed = false;
+                    self.gateway_failed = true;
+                    self.note(launch_error_message(&e));
+                }
+            }
+        }
+
+        if self.confirmed && !self.applying && self.bridge.as_ref().is_some_and(|b| b.ready()) {
+            let index = self
+                .adapters
+                .iter()
+                .find(|a| a.address == self.settings.pc_ip)
+                .map(|a| a.index)
+                .or_else(|| self.headless_iface.as_ref().map(|(_, i)| *i))
+                .unwrap_or(0);
+
+            match self
+                .route
+                .as_mut()
+                .ok_or(())
+                .and_then(|r| r.apply(self.settings.clone(), index).map_err(|_| ()))
             {
-                self.reset();
-                self.gateway_failed = true;
-                self.note("Bridge stopped. Network settings restored.");
-            }
-
-            if self.applying && self.route.as_ref().is_some_and(|r| r.clean()) {
-                self.stop_bridge();
-            }
-
-            if self.confirmed
-                && !self.closing
-                && self.authorization.is_some()
-                && self.bridge.is_none()
-                && self.route.as_ref().is_some_and(|r| r.clean())
-                {
-                    match Bridge::start(&self.settings, self.authorization.as_ref().unwrap()) {
-                        Ok(b) => {
-                            if self.headless {
-                                eprintln!("[headless] Bridge::start OK — waiting for ready()");
-                            }
-                            self.bridge = Some(b);
-                            self.note("Connecting the gateway...");
-                        }
-                        Err(e) => {
-                            eprintln!("[headless] Bridge::start FAILED: {e:?}");
-                            self.confirmed = false;
-                            self.gateway_failed = true;
-                            self.note(launch_error_message(&e));
-                        }
-                    }
+                Ok(()) => self.applying = true,
+                Err(_) => {
+                    self.reset();
+                    self.gateway_failed = true;
+                    self.note("Could not apply network settings.");
                 }
-
-                if self.confirmed && !self.applying && self.bridge.as_ref().is_some_and(|b| b.ready()) {
-                    let index = self
-                    .adapters
-                    .iter()
-                    .find(|a| a.address == self.settings.pc_ip)
-                    .map(|a| a.index)
-                    .or_else(|| self.headless_iface.as_ref().map(|(_, i)| *i))
-                    .unwrap_or(0);
-
-                    match self
-                    .route
-                    .as_mut()
-                    .ok_or(())
-                    .and_then(|r| r.apply(self.settings.clone(), index).map_err(|_| ()))
-                    {
-                        Ok(()) => self.applying = true,
-                        Err(_) => {
-                            self.reset();
-                            self.gateway_failed = true;
-                            self.note("Could not apply network settings.");
-                        }
-                    }
-                }
+            }
+        }
     }
 }
 
@@ -623,145 +745,145 @@ impl eframe::App for App {
 
         if ctx.input(|i| i.viewport().close_requested())
             || self.smoke_deadline.is_some_and(|d| Instant::now() >= d)
-            {
-                self.begin_close();
-            }
+        {
+            self.begin_close();
+        }
 
-            if self.closing {
-                if self.route.is_some() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                } else {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            } else if self.close_failed {
+        if self.closing {
+            if self.route.is_some() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        } else if self.close_failed {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+
+        let active = self.route.as_ref().is_some_and(|r| r.active());
+        let clean = self.route.as_ref().is_some_and(|r| r.clean());
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("P2 middleware");
+            ui.add_space(4.0);
+
+            let (color, value) = if self.closing {
+                (AMBER, "Cleaning up")
+            } else if active || clean {
+                (GREEN, "Ready")
+            } else if self.route.is_some() {
+                (AMBER, "Starting")
+            } else {
+                (RED, "Stopped")
+            };
+            status(ui, color, "Network helper", value);
+
+            let (color, value) = if self.authorization.is_some() {
+                (GREEN, "Signed in")
+            } else if self.approval.is_some() {
+                (AMBER, "Waiting for approval")
+            } else if self.steam_failed {
+                (RED, "Sign-in failed")
+            } else {
+                (GRAY, "Signed out")
+            };
+            status(ui, color, "Steam", value);
+
+            let (color, value) = if active {
+                (GREEN, "Active")
+            } else if self.confirmed {
+                (AMBER, "Connecting")
+            } else if self.gateway_failed {
+                (RED, "Failed")
+            } else {
+                (GRAY, "Off")
+            };
+            status(ui, color, "Gateway", value);
+
+            if !self.notice.is_empty() {
+                ui.small(&self.notice);
             }
 
-            let active = self.route.as_ref().is_some_and(|r| r.active());
-            let clean = self.route.as_ref().is_some_and(|r| r.clean());
+            if self.route.is_none() && !self.closing && ui.button("Retry").clicked() {
+                self.close_failed = false;
+                self.start_session();
+            }
 
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.heading("P2 middleware");
-                ui.add_space(4.0);
-
-                let (color, value) = if self.closing {
-                    (AMBER, "Cleaning up")
-                } else if active || clean {
-                    (GREEN, "Ready")
-                } else if self.route.is_some() {
-                    (AMBER, "Starting")
+            ui.separator();
+            ui.label("PS3 gateway");
+            ui.label(
+                RichText::new(if active {
+                    self.settings.pc_ip.as_str()
                 } else {
-                    (RED, "Stopped")
-                };
-                status(ui, color, "Network helper", value);
+                    "—"
+                })
+                .size(28.0)
+                .strong()
+                .color(if active { GREEN } else { GRAY }),
+            );
+            ui.small("Set this as the PS3's gateway while the app is open. Restore it afterwards.");
 
-                let (color, value) = if self.authorization.is_some() {
-                    (GREEN, "Signed in")
-                } else if self.approval.is_some() {
-                    (AMBER, "Waiting for approval")
-                } else if self.steam_failed {
-                    (RED, "Sign-in failed")
-                } else {
-                    (GRAY, "Signed out")
-                };
-                status(ui, color, "Steam", value);
-
-                let (color, value) = if active {
-                    (GREEN, "Active")
-                } else if self.confirmed {
-                    (AMBER, "Connecting")
-                } else if self.gateway_failed {
-                    (RED, "Failed")
-                } else {
-                    (GRAY, "Off")
-                };
-                status(ui, color, "Gateway", value);
-
-                if !self.notice.is_empty() {
-                    ui.small(&self.notice);
-                }
-
-                if self.route.is_none() && !self.closing && ui.button("Retry").clicked() {
-                    self.close_failed = false;
-                    self.start_session();
-                }
-
-                ui.separator();
-                ui.label("PS3 gateway");
-                ui.label(
-                    RichText::new(if active {
-                        self.settings.pc_ip.as_str()
-                    } else {
-                        "—"
-                    })
-                    .size(28.0)
-                    .strong()
-                    .color(if active { GREEN } else { GRAY }),
-                );
-                ui.small("Set this as the PS3's gateway while the app is open. Restore it afterwards.");
-
-                ui.separator();
-                ui.label("PS3 IP address");
-                ui.small("PS3: Settings → Network Settings → Settings and Connection Status List.");
-                ui.add_enabled_ui(clean && !self.confirmed && !self.closing, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.settings.ps3_ip).desired_width(180.0),
-                        );
-                        if ui.button("Confirm").clicked() {
-                            self.confirm();
-                        }
-                    });
-                    if network::for_console(&self.adapters, &self.settings.ps3_ip).is_err()
-                        && !self.adapters.is_empty()
-                        {
-                            egui::ComboBox::from_id_salt("adapter")
-                            .selected_text(
-                                self.selected
+            ui.separator();
+            ui.label("PS3 IP address");
+            ui.small("PS3: Settings → Network Settings → Settings and Connection Status List.");
+            ui.add_enabled_ui(clean && !self.confirmed && !self.closing, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.ps3_ip).desired_width(180.0),
+                    );
+                    if ui.button("Confirm").clicked() {
+                        self.confirm();
+                    }
+                });
+                if network::for_console(&self.adapters, &self.settings.ps3_ip).is_err()
+                    && !self.adapters.is_empty()
+                {
+                    egui::ComboBox::from_id_salt("adapter")
+                        .selected_text(
+                            self.selected
                                 .and_then(|id| self.adapters.iter().find(|a| a.index == id))
                                 .map(|a| a.name.as_str())
                                 .unwrap_or("Select home network"),
-                            )
-                            .show_ui(ui, |ui| {
-                                for a in &self.adapters {
-                                    ui.selectable_value(
-                                        &mut self.selected,
-                                        Some(a.index),
-                                                        format!("{} ({})", a.name, a.address),
-                                    );
-                                }
-                            });
-                        }
-                });
-
-                if self.confirmed && ui.button("Disconnect").clicked() {
-                    self.reset();
+                        )
+                        .show_ui(ui, |ui| {
+                            for a in &self.adapters {
+                                ui.selectable_value(
+                                    &mut self.selected,
+                                    Some(a.index),
+                                    format!("{} ({})", a.name, a.address),
+                                );
+                            }
+                        });
                 }
-
-                ui.separator();
-                ui.label("Steam account");
-                if let Some(qr) = &self.qr {
-                    ui.add(egui::Image::new(qr).fit_to_exact_size(egui::vec2(200.0, 200.0)));
-                    ui.small("Steam app → Steam Guard → Scan QR code");
-                }
-                ui.horizontal(|ui| {
-                    if let Some(auth) = &self.authorization {
-                        ui.label(auth.account_name.as_str());
-                        if ui.button("Forget").clicked() {
-                            self.forget();
-                        }
-                    } else if self.approval.is_some() {
-                        if ui.button("Cancel").clicked() {
-                            self.forget();
-                        }
-                    } else if ui
-                        .add_enabled(!self.closing, egui::Button::new("Sign in"))
-                        .clicked()
-                        {
-                            self.approve();
-                        }
-                });
             });
+
+            if self.confirmed && ui.button("Disconnect").clicked() {
+                self.reset();
+            }
+
+            ui.separator();
+            ui.label("Steam account");
+            if let Some(qr) = &self.qr {
+                ui.add(egui::Image::new(qr).fit_to_exact_size(egui::vec2(200.0, 200.0)));
+                ui.small("Steam app → Steam Guard → Scan QR code");
+            }
+            ui.horizontal(|ui| {
+                if let Some(auth) = &self.authorization {
+                    ui.label(auth.account_name.as_str());
+                    if ui.button("Forget").clicked() {
+                        self.forget();
+                    }
+                } else if self.approval.is_some() {
+                    if ui.button("Cancel").clicked() {
+                        self.forget();
+                    }
+                } else if ui
+                    .add_enabled(!self.closing, egui::Button::new("Sign in"))
+                    .clicked()
+                {
+                    self.approve();
+                }
+            });
+        });
     }
 }
 
@@ -780,11 +902,34 @@ impl Drop for App {
 include!("qr_image.rs");
 
 fn main() -> eframe::Result {
+    // ---- Pairing subcommands: dispatch once and exit before the GUI. ----
+    let args_vec: Vec<String> = std::env::args().collect();
+    if args_vec.len() > 1 {
+        match args_vec[1].as_str() {
+            "pair-host" => {
+                let code = pairing_cli::run_pair_host();
+                let _ = std::io::stdout().flush();
+                std::process::exit(code);
+            }
+            "pair-join" => {
+                if args_vec.len() < 3 {
+                    eprintln!("usage: <binary> pair-join <host-public-ip> [code]");
+                    std::process::exit(1);
+                }
+                let code = args_vec.get(3).map(String::as_str);
+                let exit = pairing_cli::run_pair_join(&args_vec[2], code);
+                let _ = std::io::stdout().flush();
+                std::process::exit(exit);
+            }
+            _ => {}
+        }
+    }
+
+    // ---- Original flag parsing, unchanged ----
     let mut smoke = false;
     let mut headless = false;
     let mut ps3: Option<String> = None;
     let mut router: Option<String> = None;
-
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -800,11 +945,11 @@ fn main() -> eframe::Result {
         "P2 middleware",
         eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
-            .with_inner_size([420.0, 600.0])
-            .with_min_inner_size([380.0, 480.0])
-            .with_visible(!headless),
-                       renderer: eframe::Renderer::Glow,
-                       ..Default::default()
+                .with_inner_size([420.0, 600.0])
+                .with_min_inner_size([380.0, 480.0])
+                .with_visible(!headless),
+            renderer: eframe::Renderer::Glow,
+            ..Default::default()
         },
         Box::new(move |cc| Ok(Box::new(App::new(cc, smoke, headless, ps3, router)))),
     )

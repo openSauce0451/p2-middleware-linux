@@ -21,10 +21,10 @@ fn run(binary: &str, socket: &str, parent: u32, launcher: Option<&str>) -> io::R
         None => Command::new(binary),
     };
     cmd.args(["--pipe", socket, "--parent", &parent.to_string()])
-    .stdin(Stdio::null())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
 }
 
 /// Root, or holding CAP_NET_ADMIN (bit 12 of the effective set).

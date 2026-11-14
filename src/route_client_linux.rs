@@ -42,12 +42,15 @@ impl RouteClient {
         if !self.clean() {
             return Err(io::Error::other("gateway_not_ready"));
         }
-        let request = ControlCmd::Start(crate::request::Request { settings, interface });
+        let request = ControlCmd::Start(crate::request::Request {
+            settings,
+            interface,
+        });
         request.validate()?;
         self.state.store(0, Ordering::Release);
         self.commands
-        .send(request)
-        .map_err(|_| io::Error::other("helper_disconnected"))
+            .send(request)
+            .map_err(|_| io::Error::other("helper_disconnected"))
     }
 
     pub fn reset(&mut self) {
@@ -63,7 +66,9 @@ impl RouteClient {
         match self.done.try_recv() {
             Ok(done) => Ok(Some(done)),
             Err(mpsc::TryRecvError::Empty) => Ok(None),
-            Err(mpsc::TryRecvError::Disconnected) => Err(io::Error::other("helper_controller_ended")),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err(io::Error::other("helper_controller_ended"))
+            }
         }
     }
 
@@ -82,20 +87,20 @@ impl RouteClient {
         let worker_stop = stop.clone();
 
         thread::Builder::new()
-        .name("p2-route-control".into())
-        .spawn(move || {
-            let success = control_loop(
-                socket_path,
-                parent,
-                binary,
-                worker_state,
-                incoming,
-                tx_events,
-                worker_stop,
-            )
-            .unwrap_or(false);
-            let _ = tx_done.send(success);
-        })?;
+            .name("p2-route-control".into())
+            .spawn(move || {
+                let success = control_loop(
+                    socket_path,
+                    parent,
+                    binary,
+                    worker_state,
+                    incoming,
+                    tx_events,
+                    worker_stop,
+                )
+                .unwrap_or(false);
+                let _ = tx_done.send(success);
+            })?;
 
         Ok(Self {
             stop,
@@ -119,8 +124,8 @@ fn control_loop(
     let runtime = control_linux::runtime()?;
     runtime.block_on(async {
         let path = socket_path
-        .to_str()
-        .ok_or_else(|| io::Error::other("socket_path"))?;
+            .to_str()
+            .ok_or_else(|| io::Error::other("socket_path"))?;
 
         // Bind before launching, so the helper cannot race ahead of the listener.
         let server = control_linux::server(path)?;
@@ -128,22 +133,22 @@ fn control_loop(
         let _ = tx_events.send("Approve the system prompt to start the network helper.");
         let mut child = elevation_linux::elevate(
             binary
-            .to_str()
-            .ok_or_else(|| io::Error::other("binary_path"))?,
-                                                 path,
-                                                 parent,
+                .to_str()
+                .ok_or_else(|| io::Error::other("binary_path"))?,
+            path,
+            parent,
         )?;
 
         let mut stream = match tokio::time::timeout(Duration::from_secs(30), server.connect()).await
         {
             Ok(Ok(stream)) => stream,
-                     Ok(Err(e)) => return Err(e),
-                     Err(_) => {
-                         return Err(io::Error::new(
-                             io::ErrorKind::TimedOut,
-                             "helper_connect_timeout",
-                         ))
-                     }
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "helper_connect_timeout",
+                ))
+            }
         };
 
         send(&mut stream, &ControlCmd::Session).await?;
@@ -175,11 +180,11 @@ fn control_loop(
                         if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
                             match value["event"].as_str() {
                                 Some("session_clean") => state.store(1, Ordering::Release),
-                     Some("route_ready") => state.store(2, Ordering::Release),
-                     Some("restoring" | "recovery_incomplete") => {
-                         state.store(0, Ordering::Release)
-                     }
-                     _ => {}
+                                Some("route_ready") => state.store(2, Ordering::Release),
+                                Some("restoring" | "recovery_incomplete") => {
+                                    state.store(0, Ordering::Release)
+                                }
+                                _ => {}
                             }
                         }
                         if let Some(message) = friendly(text) {
@@ -211,18 +216,18 @@ fn friendly(line: &str) -> Option<&'static str> {
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
     Some(match value["event"].as_str()? {
         "session_clean" => "Network cleanup complete. Ready for a PS3 address.",
-         "route_ready" => "Linux gateway is active. Set the PS3 gateway to this PC.",
-         "restoring" => "Restoring the previous network settings...",
-         "restored" => "Previous network settings restored.",
-         "administrator_required" => "The network helper needs administrator permission.",
-         "recovery_incomplete" => {
-             "Cleanup could not finish. The saved record was kept; it is retried on next start."
-         }
-         "store_unavailable" => {
-             "The protected cleanup record is unavailable. No network change was made."
-         }
-         "activation_failed" => "Gateway setup failed and was rolled back.",
-         _ => return None,
+        "route_ready" => "Linux gateway is active. Set the PS3 gateway to this PC.",
+        "restoring" => "Restoring the previous network settings...",
+        "restored" => "Previous network settings restored.",
+        "administrator_required" => "The network helper needs administrator permission.",
+        "recovery_incomplete" => {
+            "Cleanup could not finish. The saved record was kept; it is retried on next start."
+        }
+        "store_unavailable" => {
+            "The protected cleanup record is unavailable. No network change was made."
+        }
+        "activation_failed" => "Gateway setup failed and was rolled back.",
+        _ => return None,
     })
 }
 

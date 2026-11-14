@@ -52,7 +52,10 @@ impl Lines {
                 return if self.pending.is_empty() {
                     Ok(None)
                 } else {
-                    Err(io::Error::new(io::ErrorKind::UnexpectedEof, "control_partial_frame"))
+                    Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "control_partial_frame",
+                    ))
                 };
             }
             self.pending.extend_from_slice(&chunk[..count]);
@@ -62,7 +65,7 @@ impl Lines {
 
 pub async fn send(
     output: &mut (impl tokio::io::AsyncWrite + Unpin),
-                  value: &impl Serialize,
+    value: &impl Serialize,
 ) -> io::Result<()> {
     let mut bytes = serde_json::to_vec(value)?;
     if bytes.len() >= LIMIT {
@@ -70,12 +73,12 @@ pub async fn send(
     }
     bytes.push(b'\n');
     tokio::time::timeout(std::time::Duration::from_secs(3), output.write_all(&bytes))
-    .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "control_write_timeout"))?
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "control_write_timeout"))?
 }
 
 pub fn runtime() -> io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread()
-    .enable_all()
-    .build()
+        .enable_all()
+        .build()
 }
