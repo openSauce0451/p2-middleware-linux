@@ -49,7 +49,8 @@ Do every step on **BOTH computers** before moving on to the next step.
 ## Step 2 — Give your PS3 a permanent address (both players, once)
 
 So the setup never breaks when the PS3 restarts, tell your router to always hand your PS3 the same address. This is called a *DHCP reservation*: open your router's admin page (usually `http://192.168.0.1` or `http://10.0.0.1`), find your PS3 in the list of devices, and set it to "reserve" / "static". Any address is fine — note down which one it gets (it looks like `192.168.0.242` or `10.0.0.182`).
-Optionally, set the IP address of your PS3 manually in the PS3 Network Settings -> IP Address Settings
+
+**Optionally**, set the IP address of your PS3 manually in the PS3 Network Settings -> IP Address Settings
 
 ---
 
