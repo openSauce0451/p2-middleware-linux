@@ -1,6 +1,6 @@
 [package]
 name = "p2-bridge-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 publish = false
 
@@ -22,9 +22,13 @@ crc32fast = "=1.5.0"
 flate2 = "=1.1.9"
 hmac = "=0.12.1"
 sha1 = "=0.10.6"
+sha2 = "0.10"
+spake2 = "0.3"
 rsa = "=0.9.10"
 subtle = "=2.6.1"
 zeroize = "=1.9.0"
 reqwest = { version = "=0.13.5", optional = true, default-features = false, features = ["blocking", "json", "form", "native-tls"] }
 qrcode = { version = "=0.14.1", optional = true, default-features = false, features = ["svg"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
