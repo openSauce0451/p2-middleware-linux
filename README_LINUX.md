@@ -64,9 +64,9 @@ The bridge listens on TCP <Steam port>; the PS3's Steam traffic is intercepted b
 
 - A PS3 on the same subnet as the PC running the middleware, with **Portal 2 Steam-linked**
 
-  - Steam co-op partner with a copy of Portal 2 can be **local or over Internet**
+  - Steam co-op partner with a copy of Portal 2 in local network. **Over Internet not tested**
 
-  - **PS3 <-> PS3 reportedly possible with each PS3 player running the middleware on their PC**
+  - **PS3 <-> PS3 over Internet: See [TUNNEL_README](https://github.com/openSauce0451/p2-middleware-linux/blob/tunnel/README_TUNNEL.md)**
 
 - The Steam mobile app on your phone, to scan the QR code
 
